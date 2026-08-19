@@ -27,7 +27,7 @@ async function run(): Promise<void> {
     const pullNumber = cliOptions.pullNumber || context.payload?.pull_request?.number;
     const maxDiffLines = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
     const agentCommand = core.getInput('agent-command', { required: false }) || 'copilot';
-    const agentArgsInput = core.getInput('agent-args', { required: false }) || 'acp-server';
+    const agentArgsInput = core.getInput('agent-args', { required: false }) || ' --acp';
     const agentArgs = agentArgsInput.split(' ').filter(Boolean);
 
     console.log(`\n🔍 Pipeline Assistant (ACP + Read-Only MCP)`);
@@ -145,7 +145,7 @@ Commit Message: ${commitMessage}
       await acpBridge.start();
 
       await acpBridge.sendRequest('initialize', {
-        protocolVersion: '1.0',
+        protocolVersion: 1,
         clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
         capabilities: {
           readOnly: true,
