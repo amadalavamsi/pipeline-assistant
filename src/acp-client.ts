@@ -2,10 +2,12 @@
  * ACP (Agent Client Protocol) Bridge Engine
  * Handles JSON-RPC 2.0 connection to the ACP Agent runner (GitHub Copilot ACP server).
  * Strictly enforces Read-Only execution, zero bash terminal execution, and zero file modification.
+ * Features comprehensive logging for every inbound and outbound message.
  */
 
 import { spawn, ChildProcess } from 'child_process';
 import { ReadOnlyMcpServer } from './mcp-tools';
+import { ProtocolLogger } from './logger';
 
 export interface AcpSessionConfig {
   workspacePath: string;
@@ -36,6 +38,8 @@ export class AcpClientBridge {
   public async start(): Promise<void> {
     const cmd = this.config.agentCommand;
     const args = this.config.agentArgs || [];
+
+    console.log(`[ACP Process] Launching: ${cmd} ${args.join(' ')}`);
 
     this.process = spawn(cmd, args, {
       stdio: ['pipe', 'pipe', 'inherit'],
@@ -71,6 +75,7 @@ export class AcpClientBridge {
 
       // Response to a request we sent
       if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+        ProtocolLogger.acpInboundResponse(msg.id, msg.result, msg.error);
         const handler = this.pendingRequests.get(msg.id);
         if (handler) {
           this.pendingRequests.delete(msg.id);
@@ -85,6 +90,7 @@ export class AcpClientBridge {
 
       // Request from Agent to Client (e.g. tool execution, permission, file edit)
       if (msg.method) {
+        ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
         this.handleAgentRequest(msg);
       }
     } catch {
@@ -98,12 +104,14 @@ export class AcpClientBridge {
 
     // Security Gate 1: Deny any bash / shell command execution requests
     if (method === 'client/requestPermission' || method === 'client/runCommand' || method === 'terminal/execute') {
-      console.log(`[ACP Security Gate] BLOCKED execution request: ${method}`);
+      const reason = 'Terminal execution is strictly disabled in CI/CD analysis mode.';
+      ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
+
       if (reqId !== undefined) {
         this.sendResponse({
           jsonrpc: '2.0',
           id: reqId,
-          result: { granted: false, reason: 'Terminal execution is strictly disabled in CI/CD analysis mode.' }
+          result: { granted: false, reason }
         });
       }
       return;
@@ -111,12 +119,14 @@ export class AcpClientBridge {
 
     // Security Gate 2: Deny any file write / code modifications
     if (method === 'client/applyEdit' || method === 'workspace/applyEdit' || method === 'fs/write') {
-      console.log(`[ACP Security Gate] BLOCKED file modification request: ${method}`);
+      const reason = 'File modification is disabled in Read-Only analysis mode.';
+      ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
+
       if (reqId !== undefined) {
         this.sendResponse({
           jsonrpc: '2.0',
           id: reqId,
-          result: { success: false, reason: 'File modification is disabled in Read-Only analysis mode.' }
+          result: { success: false, reason }
         });
       }
       return;
@@ -128,7 +138,6 @@ export class AcpClientBridge {
       const toolArgs = (req.params as any)?.arguments || (req.params as any)?.args || {};
 
       try {
-        console.log(`[MCP Tool Invoked] ${toolName}`);
         const resultString = await this.mcpServer.executeTool(toolName, toolArgs);
         if (reqId !== undefined) {
           this.sendResponse({
@@ -159,6 +168,8 @@ export class AcpClientBridge {
       method,
       params
     };
+
+    ProtocolLogger.acpOutbound(method, id, params);
 
     return new Promise((resolve, reject) => {
       this.pendingRequests.set(id, { resolve, reject });

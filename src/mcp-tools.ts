@@ -1,9 +1,11 @@
 /**
  * In-Memory Read-Only MCP Server providing tools to read failed job logs and PR commit diffs.
+ * Includes complete audit logging for every tool invocation and return payload.
  */
 
 import { getOctokit } from '@actions/github';
 import { sanitizeText, extractErrorLogWindow } from './sanitizer';
+import { ProtocolLogger } from './logger';
 
 export interface McpToolDefinition {
   name: string;
@@ -61,23 +63,27 @@ export function createReadOnlyMcpServer(
     listTools: () => tools,
 
     executeTool: async (name: string, args: Record<string, unknown>): Promise<string> => {
+      ProtocolLogger.mcpToolInvoked(name, args);
+
       switch (name) {
         case 'get_failed_job_logs': {
-          const jobsResponse = await octokit.rest.actions.listJobsForWorkflowRun({
-            owner: context.owner,
-            repo: context.repo,
-            run_id: context.runId
-          });
-
-          const failedJob = jobsResponse.data.jobs.find(
-            j => j.conclusion === 'failure' || j.status === 'in_progress'
-          );
-
-          if (!failedJob) {
-            return JSON.stringify({ message: 'No failed jobs found in workflow run.' });
-          }
-
           try {
+            const jobsResponse = await octokit.rest.actions.listJobsForWorkflowRun({
+              owner: context.owner,
+              repo: context.repo,
+              run_id: context.runId
+            });
+
+            const failedJob = jobsResponse.data.jobs.find(
+              j => j.conclusion === 'failure' || j.status === 'in_progress'
+            );
+
+            if (!failedJob) {
+              const res = JSON.stringify({ message: 'No failed jobs found in workflow run.' });
+              ProtocolLogger.mcpToolResult(name, 'No failed jobs found', res.length);
+              return res;
+            }
+
             const logsResponse = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
               owner: context.owner,
               repo: context.repo,
@@ -88,20 +94,26 @@ export function createReadOnlyMcpServer(
             const sanitized = sanitizeText(rawLog);
             const errorWindow = extractErrorLogWindow(sanitized, 120);
 
-            return JSON.stringify({
+            const result = JSON.stringify({
               jobName: failedJob.name,
               jobId: failedJob.id,
               errorLogWindow: errorWindow
             });
+
+            ProtocolLogger.mcpToolResult(name, `Extracted error window for job: ${failedJob.name}`, result.length);
+            return result;
           } catch (err: unknown) {
             const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
             return JSON.stringify({ error: `Failed to download logs: ${error.message}` });
           }
         }
 
         case 'get_pull_request_diff': {
           if (!context.pullNumber) {
-            return JSON.stringify({ message: 'No pull request associated with this workflow run.' });
+            const res = JSON.stringify({ message: 'No pull request associated with this workflow run.' });
+            ProtocolLogger.mcpToolResult(name, 'No PR context', res.length);
+            return res;
           }
 
           try {
@@ -119,34 +131,50 @@ export function createReadOnlyMcpServer(
             const diffLines = sanitized.split('\n');
             const limitedDiff = diffLines.slice(0, context.maxDiffLines).join('\n');
 
-            return JSON.stringify({
+            const result = JSON.stringify({
               pullNumber: context.pullNumber,
               totalLines: diffLines.length,
               diffSnippet: limitedDiff
             });
+
+            ProtocolLogger.mcpToolResult(name, `Fetched ${diffLines.length} diff lines (capped to ${context.maxDiffLines})`, result.length);
+            return result;
           } catch (err: unknown) {
             const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
             return JSON.stringify({ error: `Failed to fetch PR diff: ${error.message}` });
           }
         }
 
         case 'get_commit_metadata': {
-          const run = await octokit.rest.actions.getWorkflowRun({
-            owner: context.owner,
-            repo: context.repo,
-            run_id: context.runId
-          });
+          try {
+            const run = await octokit.rest.actions.getWorkflowRun({
+              owner: context.owner,
+              repo: context.repo,
+              run_id: context.runId
+            });
 
-          return JSON.stringify({
-            commitSha: run.data.head_sha,
-            commitMessage: run.data.head_commit?.message || '',
-            author: run.data.head_commit?.author?.name || '',
-            event: run.data.event
-          });
+            const result = JSON.stringify({
+              commitSha: run.data.head_sha,
+              commitMessage: run.data.head_commit?.message || '',
+              author: run.data.head_commit?.author?.name || '',
+              event: run.data.event
+            });
+
+            ProtocolLogger.mcpToolResult(name, `Retrieved commit ${run.data.head_sha?.substring(0, 7)}`, result.length);
+            return result;
+          } catch (err: unknown) {
+            const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
+            return JSON.stringify({ error: `Failed to fetch commit metadata: ${error.message}` });
+          }
         }
 
-        default:
-          throw new Error(`Tool "${name}" is not supported in read-only mode.`);
+        default: {
+          const err = `Tool "${name}" is not supported in read-only mode.`;
+          ProtocolLogger.mcpToolError(name, err);
+          throw new Error(err);
+        }
       }
     }
   };

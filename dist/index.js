@@ -29931,10 +29931,12 @@ function wrappy (fn, cb) {
  * ACP (Agent Client Protocol) Bridge Engine
  * Handles JSON-RPC 2.0 connection to the ACP Agent runner (GitHub Copilot ACP server).
  * Strictly enforces Read-Only execution, zero bash terminal execution, and zero file modification.
+ * Features comprehensive logging for every inbound and outbound message.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.AcpClientBridge = void 0;
 const child_process_1 = __nccwpck_require__(5317);
+const logger_1 = __nccwpck_require__(6999);
 class AcpClientBridge {
     config;
     process = null;
@@ -29948,6 +29950,7 @@ class AcpClientBridge {
     async start() {
         const cmd = this.config.agentCommand;
         const args = this.config.agentArgs || [];
+        console.log(`[ACP Process] Launching: ${cmd} ${args.join(' ')}`);
         this.process = (0, child_process_1.spawn)(cmd, args, {
             stdio: ['pipe', 'pipe', 'inherit'],
             env: { ...process.env, CI: 'true', READ_ONLY_MODE: 'true' }
@@ -29976,6 +29979,7 @@ class AcpClientBridge {
             const msg = JSON.parse(rawJson);
             // Response to a request we sent
             if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+                logger_1.ProtocolLogger.acpInboundResponse(msg.id, msg.result, msg.error);
                 const handler = this.pendingRequests.get(msg.id);
                 if (handler) {
                     this.pendingRequests.delete(msg.id);
@@ -29990,6 +29994,7 @@ class AcpClientBridge {
             }
             // Request from Agent to Client (e.g. tool execution, permission, file edit)
             if (msg.method) {
+                logger_1.ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
                 this.handleAgentRequest(msg);
             }
         }
@@ -30002,24 +30007,26 @@ class AcpClientBridge {
         const reqId = req.id;
         // Security Gate 1: Deny any bash / shell command execution requests
         if (method === 'client/requestPermission' || method === 'client/runCommand' || method === 'terminal/execute') {
-            console.log(`[ACP Security Gate] BLOCKED execution request: ${method}`);
+            const reason = 'Terminal execution is strictly disabled in CI/CD analysis mode.';
+            logger_1.ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
             if (reqId !== undefined) {
                 this.sendResponse({
                     jsonrpc: '2.0',
                     id: reqId,
-                    result: { granted: false, reason: 'Terminal execution is strictly disabled in CI/CD analysis mode.' }
+                    result: { granted: false, reason }
                 });
             }
             return;
         }
         // Security Gate 2: Deny any file write / code modifications
         if (method === 'client/applyEdit' || method === 'workspace/applyEdit' || method === 'fs/write') {
-            console.log(`[ACP Security Gate] BLOCKED file modification request: ${method}`);
+            const reason = 'File modification is disabled in Read-Only analysis mode.';
+            logger_1.ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
             if (reqId !== undefined) {
                 this.sendResponse({
                     jsonrpc: '2.0',
                     id: reqId,
-                    result: { success: false, reason: 'File modification is disabled in Read-Only analysis mode.' }
+                    result: { success: false, reason }
                 });
             }
             return;
@@ -30029,7 +30036,6 @@ class AcpClientBridge {
             const toolName = req.params?.name || req.params?.toolName;
             const toolArgs = req.params?.arguments || req.params?.args || {};
             try {
-                console.log(`[MCP Tool Invoked] ${toolName}`);
                 const resultString = await this.mcpServer.executeTool(toolName, toolArgs);
                 if (reqId !== undefined) {
                     this.sendResponse({
@@ -30060,6 +30066,7 @@ class AcpClientBridge {
             method,
             params
         };
+        logger_1.ProtocolLogger.acpOutbound(method, id, params);
         return new Promise((resolve, reject) => {
             this.pendingRequests.set(id, { resolve, reject });
             this.sendMessage(message);
@@ -30380,6 +30387,72 @@ run();
 
 /***/ }),
 
+/***/ 6999:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Structured Logger for ACP (Agent Client Protocol) and MCP (Model Context Protocol)
+ * Provides detailed timestamps, message direction markers, and security gate audit traces.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ProtocolLogger = void 0;
+class ProtocolLogger {
+    static formatTime() {
+        return new Date().toISOString();
+    }
+    // --- ACP PROTOCOL LOGS ---
+    static acpOutbound(method, id, params) {
+        console.log(`\n[${this.formatTime()}] 🚀 [ACP OUTBOUND REQUEST] (Client -> Agent)`);
+        console.log(`  ├─ Method: ${method}`);
+        console.log(`  ├─ ID: ${id !== undefined ? id : 'notification'}`);
+        console.log(`  └─ Params: ${JSON.stringify(params, null, 2)}`);
+    }
+    static acpInboundResponse(id, result, error) {
+        console.log(`\n[${this.formatTime()}] 📥 [ACP INBOUND RESPONSE] (Agent -> Client)`);
+        console.log(`  ├─ ID: ${id}`);
+        if (error) {
+            console.log(`  └─ ❌ Error: ${JSON.stringify(error, null, 2)}`);
+        }
+        else {
+            console.log(`  └─ ✅ Result: ${JSON.stringify(result, null, 2)}`);
+        }
+    }
+    static acpInboundRequest(method, id, params) {
+        console.log(`\n[${this.formatTime()}] 📥 [ACP INBOUND REQUEST] (Agent -> Client)`);
+        console.log(`  ├─ Method: ${method}`);
+        console.log(`  ├─ ID: ${id !== undefined ? id : 'notification'}`);
+        console.log(`  └─ Params: ${JSON.stringify(params, null, 2)}`);
+    }
+    static acpSecurityBlocked(method, reason) {
+        console.warn(`\n[${this.formatTime()}] 🛡️ [ACP SECURITY GATE: BLOCKED]`);
+        console.warn(`  ├─ Blocked Method: ${method}`);
+        console.warn(`  └─ Enforcement Reason: ${reason}`);
+    }
+    // --- MCP READ-ONLY TOOL LOGS ---
+    static mcpToolInvoked(toolName, args) {
+        console.log(`\n[${this.formatTime()}] 🔧 [MCP TOOL INVOKED]`);
+        console.log(`  ├─ Tool Name: ${toolName}`);
+        console.log(`  └─ Arguments: ${JSON.stringify(args, null, 2)}`);
+    }
+    static mcpToolResult(toolName, summary, payloadSize) {
+        console.log(`\n[${this.formatTime()}] 📦 [MCP TOOL RESULT]`);
+        console.log(`  ├─ Tool Name: ${toolName}`);
+        console.log(`  ├─ Summary: ${summary}`);
+        console.log(`  └─ Payload Size: ${payloadSize} bytes`);
+    }
+    static mcpToolError(toolName, error) {
+        console.error(`\n[${this.formatTime()}] ❌ [MCP TOOL ERROR]`);
+        console.error(`  ├─ Tool Name: ${toolName}`);
+        console.error(`  └─ Error: ${error}`);
+    }
+}
+exports.ProtocolLogger = ProtocolLogger;
+
+
+/***/ }),
+
 /***/ 4009:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -30387,10 +30460,12 @@ run();
 
 /**
  * In-Memory Read-Only MCP Server providing tools to read failed job logs and PR commit diffs.
+ * Includes complete audit logging for every tool invocation and return payload.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createReadOnlyMcpServer = createReadOnlyMcpServer;
 const sanitizer_1 = __nccwpck_require__(8820);
+const logger_1 = __nccwpck_require__(6999);
 function createReadOnlyMcpServer(octokit, context) {
     const tools = [
         {
@@ -30425,18 +30500,21 @@ function createReadOnlyMcpServer(octokit, context) {
     return {
         listTools: () => tools,
         executeTool: async (name, args) => {
+            logger_1.ProtocolLogger.mcpToolInvoked(name, args);
             switch (name) {
                 case 'get_failed_job_logs': {
-                    const jobsResponse = await octokit.rest.actions.listJobsForWorkflowRun({
-                        owner: context.owner,
-                        repo: context.repo,
-                        run_id: context.runId
-                    });
-                    const failedJob = jobsResponse.data.jobs.find(j => j.conclusion === 'failure' || j.status === 'in_progress');
-                    if (!failedJob) {
-                        return JSON.stringify({ message: 'No failed jobs found in workflow run.' });
-                    }
                     try {
+                        const jobsResponse = await octokit.rest.actions.listJobsForWorkflowRun({
+                            owner: context.owner,
+                            repo: context.repo,
+                            run_id: context.runId
+                        });
+                        const failedJob = jobsResponse.data.jobs.find(j => j.conclusion === 'failure' || j.status === 'in_progress');
+                        if (!failedJob) {
+                            const res = JSON.stringify({ message: 'No failed jobs found in workflow run.' });
+                            logger_1.ProtocolLogger.mcpToolResult(name, 'No failed jobs found', res.length);
+                            return res;
+                        }
                         const logsResponse = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
                             owner: context.owner,
                             repo: context.repo,
@@ -30445,20 +30523,25 @@ function createReadOnlyMcpServer(octokit, context) {
                         const rawLog = String(logsResponse.data);
                         const sanitized = (0, sanitizer_1.sanitizeText)(rawLog);
                         const errorWindow = (0, sanitizer_1.extractErrorLogWindow)(sanitized, 120);
-                        return JSON.stringify({
+                        const result = JSON.stringify({
                             jobName: failedJob.name,
                             jobId: failedJob.id,
                             errorLogWindow: errorWindow
                         });
+                        logger_1.ProtocolLogger.mcpToolResult(name, `Extracted error window for job: ${failedJob.name}`, result.length);
+                        return result;
                     }
                     catch (err) {
                         const error = err;
+                        logger_1.ProtocolLogger.mcpToolError(name, error.message);
                         return JSON.stringify({ error: `Failed to download logs: ${error.message}` });
                     }
                 }
                 case 'get_pull_request_diff': {
                     if (!context.pullNumber) {
-                        return JSON.stringify({ message: 'No pull request associated with this workflow run.' });
+                        const res = JSON.stringify({ message: 'No pull request associated with this workflow run.' });
+                        logger_1.ProtocolLogger.mcpToolResult(name, 'No PR context', res.length);
+                        return res;
                     }
                     try {
                         const diffResponse = await octokit.rest.pulls.get({
@@ -30473,32 +30556,47 @@ function createReadOnlyMcpServer(octokit, context) {
                         const sanitized = (0, sanitizer_1.sanitizeText)(rawDiff);
                         const diffLines = sanitized.split('\n');
                         const limitedDiff = diffLines.slice(0, context.maxDiffLines).join('\n');
-                        return JSON.stringify({
+                        const result = JSON.stringify({
                             pullNumber: context.pullNumber,
                             totalLines: diffLines.length,
                             diffSnippet: limitedDiff
                         });
+                        logger_1.ProtocolLogger.mcpToolResult(name, `Fetched ${diffLines.length} diff lines (capped to ${context.maxDiffLines})`, result.length);
+                        return result;
                     }
                     catch (err) {
                         const error = err;
+                        logger_1.ProtocolLogger.mcpToolError(name, error.message);
                         return JSON.stringify({ error: `Failed to fetch PR diff: ${error.message}` });
                     }
                 }
                 case 'get_commit_metadata': {
-                    const run = await octokit.rest.actions.getWorkflowRun({
-                        owner: context.owner,
-                        repo: context.repo,
-                        run_id: context.runId
-                    });
-                    return JSON.stringify({
-                        commitSha: run.data.head_sha,
-                        commitMessage: run.data.head_commit?.message || '',
-                        author: run.data.head_commit?.author?.name || '',
-                        event: run.data.event
-                    });
+                    try {
+                        const run = await octokit.rest.actions.getWorkflowRun({
+                            owner: context.owner,
+                            repo: context.repo,
+                            run_id: context.runId
+                        });
+                        const result = JSON.stringify({
+                            commitSha: run.data.head_sha,
+                            commitMessage: run.data.head_commit?.message || '',
+                            author: run.data.head_commit?.author?.name || '',
+                            event: run.data.event
+                        });
+                        logger_1.ProtocolLogger.mcpToolResult(name, `Retrieved commit ${run.data.head_sha?.substring(0, 7)}`, result.length);
+                        return result;
+                    }
+                    catch (err) {
+                        const error = err;
+                        logger_1.ProtocolLogger.mcpToolError(name, error.message);
+                        return JSON.stringify({ error: `Failed to fetch commit metadata: ${error.message}` });
+                    }
                 }
-                default:
-                    throw new Error(`Tool "${name}" is not supported in read-only mode.`);
+                default: {
+                    const err = `Tool "${name}" is not supported in read-only mode.`;
+                    logger_1.ProtocolLogger.mcpToolError(name, err);
+                    throw new Error(err);
+                }
             }
         }
     };
