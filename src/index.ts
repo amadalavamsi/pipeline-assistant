@@ -1,31 +1,128 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
+import * as fs from 'fs';
 import { createReadOnlyMcpServer } from './mcp-tools';
 import { AcpClientBridge } from './acp-client';
+import { parseCliArgs } from './cli-parser';
+import { getSystemPrompt, formatReportTemplate } from './templates';
+import { sanitizeText, extractErrorLogWindow } from './sanitizer';
 
 const BOT_COMMENT_SIGNATURE = '<!-- pipeline-assistant-report -->';
 
 async function run(): Promise<void> {
   try {
-    const githubToken = core.getInput('github-token', { required: false }) || process.env.GITHUB_TOKEN;
-    if (!githubToken) {
-      throw new Error('GITHUB_TOKEN is required for pipeline-assistant.');
-    }
+    const cliOptions = parseCliArgs(process.argv.slice(2));
+
+    const githubToken =
+      core.getInput('github-token', { required: false }) ||
+      process.env.GITHUB_TOKEN ||
+      'dummy-local-token';
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
-    const { owner, repo } = context.repo;
-    const runId = context.runId;
-    const pullNumber = context.payload.pull_request?.number;
+
+    const owner = cliOptions.owner || context.repo?.owner || process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
+    const repo = cliOptions.repo || context.repo?.repo || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[1] : 'local-repo');
+    const runId = cliOptions.runId || context.runId || 0;
+    const pullNumber = cliOptions.pullNumber || context.payload?.pull_request?.number;
     const maxDiffLines = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
     const agentCommand = core.getInput('agent-command', { required: false }) || 'copilot';
     const agentArgsInput = core.getInput('agent-args', { required: false }) || 'acp-server';
     const agentArgs = agentArgsInput.split(' ').filter(Boolean);
 
-    core.info(`🔍 Initializing Pipeline Assistant (ACP + MCP Engine)...`);
-    core.info(`📁 Repository: ${owner}/${repo} | Run ID: ${runId} | PR: #${pullNumber || 'N/A'}`);
+    console.log(`\n🔍 Pipeline Assistant (ACP + Read-Only MCP)`);
+    console.log(`📁 Target: ${owner}/${repo} | Run ID: ${runId || 'N/A'} | PR: #${pullNumber || 'N/A'}`);
+    if (cliOptions.noExecute) {
+      console.log(`🛡️ Mode: --no-execute (Dry-run mode: fetch & sanitize data, skip AI execution/commenting)`);
+    }
 
-    // Step 1: Initialize In-Memory Read-Only MCP Server
+    let jobName = 'CI-Job';
+    let errorLogWindow = '';
+    let diffSnippet = 'No diff available.';
+    let commitSha = 'local-head';
+    let author = 'developer';
+    let commitMessage = 'Local CLI trigger';
+
+    // Offline / Local file testing support
+    if (cliOptions.logFile && fs.existsSync(cliOptions.logFile)) {
+      console.log(`📂 Reading local log file: ${cliOptions.logFile}`);
+      const rawLog = fs.readFileSync(cliOptions.logFile, 'utf8');
+      errorLogWindow = extractErrorLogWindow(sanitizeText(rawLog), 120);
+    }
+
+    if (cliOptions.diffFile && fs.existsSync(cliOptions.diffFile)) {
+      console.log(`📂 Reading local diff file: ${cliOptions.diffFile}`);
+      const rawDiff = fs.readFileSync(cliOptions.diffFile, 'utf8');
+      diffSnippet = sanitizeText(rawDiff).split('\n').slice(0, maxDiffLines).join('\n');
+    }
+
+    // Step 1: Gather context via MCP Server if connected to GitHub
+    if (!errorLogWindow && runId > 0 && githubToken !== 'dummy-local-token') {
+      console.log('📡 Invoking Read-Only MCP Tools to fetch failure context...');
+      const mcpServer = createReadOnlyMcpServer(octokit, {
+        owner,
+        repo,
+        runId,
+        pullNumber,
+        maxDiffLines
+      });
+
+      const logDataJson = await mcpServer.executeTool('get_failed_job_logs', {});
+      const logData = JSON.parse(logDataJson);
+
+      if (logData.jobName) jobName = logData.jobName;
+      if (logData.errorLogWindow) errorLogWindow = logData.errorLogWindow;
+
+      if (pullNumber) {
+        const diffDataJson = await mcpServer.executeTool('get_pull_request_diff', { maxLines: maxDiffLines });
+        const diffData = JSON.parse(diffDataJson);
+        if (diffData.diffSnippet) diffSnippet = diffData.diffSnippet;
+      }
+
+      const commitMetaJson = await mcpServer.executeTool('get_commit_metadata', {});
+      const commitMeta = JSON.parse(commitMetaJson);
+      if (commitMeta.commitSha) commitSha = commitMeta.commitSha;
+      if (commitMeta.author) author = commitMeta.author;
+      if (commitMeta.commitMessage) commitMessage = commitMeta.commitMessage;
+    }
+
+    if (!errorLogWindow) {
+      errorLogWindow = '[Sample Error Log Window]\nError: Process completed with exit code 1.\nAssertionError: expected true to equal false\n  at UserServiceTest.ts:42';
+    }
+
+    // Step 2: Prepare Prompt from Template
+    const systemPrompt = getSystemPrompt({
+      jobName,
+      commitSha: commitSha.substring(0, 7),
+      author
+    });
+
+    const promptPayload = `Failed Job Context:
+Job Name: ${jobName}
+Error Log Window:
+\`\`\`
+${errorLogWindow}
+\`\`\`
+
+Pull Request Diff Snippet:
+\`\`\`diff
+${diffSnippet}
+\`\`\`
+
+Commit Message: ${commitMessage}
+`;
+
+    // Handle --no-execute (Dry-run mode)
+    if (cliOptions.noExecute) {
+      console.log('\n--- [DRY-RUN SYSTEM PROMPT] ---');
+      console.log(systemPrompt);
+      console.log('\n--- [DRY-RUN SANITIZED PAYLOAD] ---');
+      console.log(promptPayload);
+      console.log('\n✅ Dry-run completed successfully. (No AI execution or PR comments made)');
+      return;
+    }
+
+    // Step 3: Run ACP Agent
     const mcpServer = createReadOnlyMcpServer(octokit, {
       owner,
       repo,
@@ -34,28 +131,7 @@ async function run(): Promise<void> {
       maxDiffLines
     });
 
-    // Step 2: Fetch Context Data via MCP Tools
-    core.info('📡 Invoking MCP Tools to gather failure context...');
-    const logDataJson = await mcpServer.executeTool('get_failed_job_logs', {});
-    const logData = JSON.parse(logDataJson);
-
-    if (logData.message && logData.message.includes('No failed jobs found')) {
-      core.info('✅ No failed jobs detected. Pipeline Assistant run complete.');
-      return;
-    }
-
-    let diffSnippet = 'N/A (No PR context)';
-    if (pullNumber) {
-      const diffDataJson = await mcpServer.executeTool('get_pull_request_diff', { maxLines: maxDiffLines });
-      const diffData = JSON.parse(diffDataJson);
-      diffSnippet = diffData.diffSnippet || 'No diff retrieved.';
-    }
-
-    const commitMetaJson = await mcpServer.executeTool('get_commit_metadata', {});
-    const commitMeta = JSON.parse(commitMetaJson);
-
-    // Step 3: Start ACP Agent Subprocess with MCP Server Hook
-    core.info(`🤖 Starting ACP Agent Process: ${agentCommand} ${agentArgs.join(' ')}`);
+    console.log(`🤖 Starting ACP Agent Process: ${agentCommand} ${agentArgs.join(' ')}`);
     const acpBridge = new AcpClientBridge({
       workspacePath: process.cwd(),
       agentCommand,
@@ -68,7 +144,6 @@ async function run(): Promise<void> {
     try {
       await acpBridge.start();
 
-      // Step 4: Initialize Session & Send Diagnostic Prompt
       await acpBridge.sendRequest('initialize', {
         protocolVersion: '1.0',
         clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
@@ -80,84 +155,38 @@ async function run(): Promise<void> {
         }
       });
 
-      core.info('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
-      const systemInstructions = `You are an expert DevOps and CI/CD triage assistant.
-Analyze the provided sanitized failure log and recent commit code diff.
-Diagnose the failure root cause and provide actionable guidance.
-
-Strict requirements:
-1. Provide a concise 2-3 sentence Root Cause diagnosis.
-2. Provide the exact Log Evidence (with relevant error line numbers).
-3. Provide a Suggested Fix with exact code or configuration snippet.
-4. Output cleanly in formatted Markdown matching this schema:
-
-### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`${logData.jobName || 'Unknown'}\`
-- **Commit**: \`${commitMeta.commitSha?.substring(0, 7) || 'N/A'}\` by \`${commitMeta.author || 'dev'}\`
-
-#### 🔍 Root Cause
-<Clear, actionable 2-sentence explanation>
-
-#### 📜 Log Evidence
-\`\`\`text
-<Relevant stack trace or error log snippet>
-\`\`\`
-
-#### 💡 Suggested Fix
-<Exact solution or code correction>
-`;
-
-      const promptPayload = `Failed Job Context:
-Job Name: ${logData.jobName}
-Error Log Window:
-\`\`\`
-${logData.errorLogWindow || 'No log window available'}
-\`\`\`
-
-Pull Request Diff Snippet:
-\`\`\`diff
-${diffSnippet}
-\`\`\`
-
-Commit Message: ${commitMeta.commitMessage}
-`;
-
+      console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
       const promptResponse = await acpBridge.sendRequest('agent/prompt', {
-        system: systemInstructions,
+        system: systemPrompt,
         prompt: promptPayload
       });
 
       markdownReport = promptResponse?.content || promptResponse?.result?.content || promptResponse?.text || '';
-
       if (typeof markdownReport === 'object') {
         markdownReport = JSON.stringify(markdownReport, null, 2);
       }
     } catch (acpErr: unknown) {
       const error = acpErr as Error;
-      core.warning(`ACP Agent prompt execution note: ${error.message}`);
-      // Clean fallback formatting if ACP server runs in headless non-interactive mode
-      markdownReport = `### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`${logData.jobName || 'CI'}\`
-- **Commit**: \`${commitMeta.commitSha?.substring(0, 7) || 'Latest'}\` by \`${commitMeta.author || 'Author'}\`
-
-#### 🔍 Root Cause
-Analysis of the job logs identified failure during execution. Inspect the error log extract below.
-
-#### 📜 Log Evidence
-\`\`\`text
-${logData.errorLogWindow || 'Error log extract unavailable'}
-\`\`\`
-
-#### 💡 Suggested Fix
-Check latest commit changes against the failed assertions or permission constraints.`;
+      console.warn(`[ACP Process Notification] ${error.message}`);
+      markdownReport = formatReportTemplate({
+        jobName,
+        commitSha: commitSha.substring(0, 7),
+        author,
+        rootCause: 'Analysis of the failure logs identified build or test errors. Inspect the extract below.',
+        logEvidence: errorLogWindow,
+        suggestedFix: 'Review the failing lines in the commit diff against the assertion requirements.'
+      });
     } finally {
       acpBridge.stop();
     }
 
-    // Step 5: Post or Update Comment on Pull Request (Idempotent)
-    if (pullNumber && markdownReport) {
-      core.info(`💬 Posting diagnostic report to PR #${pullNumber}...`);
-      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & MCP.*`;
+    console.log('\n--- [GENERATED MARKDOWN REPORT] ---');
+    console.log(markdownReport);
+
+    // Step 4: Post or Update Comment on Pull Request (if in CI and pullNumber present)
+    if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
+      console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
+      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & Read-Only MCP.*`;
 
       const comments = await octokit.rest.issues.listComments({
         owner,
@@ -174,7 +203,7 @@ Check latest commit changes against the failed assertions or permission constrai
           comment_id: existingComment.id,
           body: fullCommentBody
         });
-        core.info(`🔄 Updated existing comment #${existingComment.id}`);
+        console.log(`🔄 Updated existing comment #${existingComment.id}`);
       } else {
         await octokit.rest.issues.createComment({
           owner,
@@ -182,14 +211,13 @@ Check latest commit changes against the failed assertions or permission constrai
           issue_number: pullNumber,
           body: fullCommentBody
         });
-        core.info('✨ Created new PR comment with failure diagnosis.');
+        console.log('✨ Created new PR comment with failure diagnosis.');
       }
     }
 
-    // Step 6: Set Outputs
-    core.setOutput('failed-job-name', logData.jobName || '');
+    core.setOutput('failed-job-name', jobName);
     core.setOutput('analysis-report', markdownReport);
-    core.info('🎉 Pipeline Assistant completed successfully.');
+    console.log('🎉 Pipeline Assistant completed successfully.');
 
   } catch (error: unknown) {
     const err = error as Error;

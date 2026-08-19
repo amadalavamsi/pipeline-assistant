@@ -30092,6 +30092,47 @@ exports.AcpClientBridge = AcpClientBridge;
 
 /***/ }),
 
+/***/ 6109:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parseCliArgs = parseCliArgs;
+function parseCliArgs(args) {
+    const options = {};
+    for (const arg of args) {
+        if (arg === '--no-execute' || arg === '--dry-run') {
+            options.noExecute = true;
+        }
+        else if (arg.startsWith('--run-id=')) {
+            options.runId = parseInt(arg.split('=')[1], 10);
+        }
+        else if (arg.startsWith('--job-id=')) {
+            options.jobId = parseInt(arg.split('=')[1], 10);
+        }
+        else if (arg.startsWith('--pr=') || arg.startsWith('--pull-number=')) {
+            options.pullNumber = parseInt(arg.split('=')[1], 10);
+        }
+        else if (arg.startsWith('--owner=')) {
+            options.owner = arg.split('=')[1];
+        }
+        else if (arg.startsWith('--repo=')) {
+            options.repo = arg.split('=')[1];
+        }
+        else if (arg.startsWith('--log-file=')) {
+            options.logFile = arg.split('=')[1];
+        }
+        else if (arg.startsWith('--diff-file=')) {
+            options.diffFile = arg.split('=')[1];
+        }
+    }
+    return options;
+}
+
+
+/***/ }),
+
 /***/ 9407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -30133,27 +30174,115 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
+const fs = __importStar(__nccwpck_require__(9896));
 const mcp_tools_1 = __nccwpck_require__(4009);
 const acp_client_1 = __nccwpck_require__(9719);
+const cli_parser_1 = __nccwpck_require__(6109);
+const templates_1 = __nccwpck_require__(3340);
+const sanitizer_1 = __nccwpck_require__(8820);
 const BOT_COMMENT_SIGNATURE = '<!-- pipeline-assistant-report -->';
 async function run() {
     try {
-        const githubToken = core.getInput('github-token', { required: false }) || process.env.GITHUB_TOKEN;
-        if (!githubToken) {
-            throw new Error('GITHUB_TOKEN is required for pipeline-assistant.');
-        }
+        const cliOptions = (0, cli_parser_1.parseCliArgs)(process.argv.slice(2));
+        const githubToken = core.getInput('github-token', { required: false }) ||
+            process.env.GITHUB_TOKEN ||
+            'dummy-local-token';
         const octokit = github.getOctokit(githubToken);
         const context = github.context;
-        const { owner, repo } = context.repo;
-        const runId = context.runId;
-        const pullNumber = context.payload.pull_request?.number;
+        const owner = cliOptions.owner || context.repo?.owner || process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
+        const repo = cliOptions.repo || context.repo?.repo || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[1] : 'local-repo');
+        const runId = cliOptions.runId || context.runId || 0;
+        const pullNumber = cliOptions.pullNumber || context.payload?.pull_request?.number;
         const maxDiffLines = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
         const agentCommand = core.getInput('agent-command', { required: false }) || 'copilot';
         const agentArgsInput = core.getInput('agent-args', { required: false }) || 'acp-server';
         const agentArgs = agentArgsInput.split(' ').filter(Boolean);
-        core.info(`🔍 Initializing Pipeline Assistant (ACP + MCP Engine)...`);
-        core.info(`📁 Repository: ${owner}/${repo} | Run ID: ${runId} | PR: #${pullNumber || 'N/A'}`);
-        // Step 1: Initialize In-Memory Read-Only MCP Server
+        console.log(`\n🔍 Pipeline Assistant (ACP + Read-Only MCP)`);
+        console.log(`📁 Target: ${owner}/${repo} | Run ID: ${runId || 'N/A'} | PR: #${pullNumber || 'N/A'}`);
+        if (cliOptions.noExecute) {
+            console.log(`🛡️ Mode: --no-execute (Dry-run mode: fetch & sanitize data, skip AI execution/commenting)`);
+        }
+        let jobName = 'CI-Job';
+        let errorLogWindow = '';
+        let diffSnippet = 'No diff available.';
+        let commitSha = 'local-head';
+        let author = 'developer';
+        let commitMessage = 'Local CLI trigger';
+        // Offline / Local file testing support
+        if (cliOptions.logFile && fs.existsSync(cliOptions.logFile)) {
+            console.log(`📂 Reading local log file: ${cliOptions.logFile}`);
+            const rawLog = fs.readFileSync(cliOptions.logFile, 'utf8');
+            errorLogWindow = (0, sanitizer_1.extractErrorLogWindow)((0, sanitizer_1.sanitizeText)(rawLog), 120);
+        }
+        if (cliOptions.diffFile && fs.existsSync(cliOptions.diffFile)) {
+            console.log(`📂 Reading local diff file: ${cliOptions.diffFile}`);
+            const rawDiff = fs.readFileSync(cliOptions.diffFile, 'utf8');
+            diffSnippet = (0, sanitizer_1.sanitizeText)(rawDiff).split('\n').slice(0, maxDiffLines).join('\n');
+        }
+        // Step 1: Gather context via MCP Server if connected to GitHub
+        if (!errorLogWindow && runId > 0 && githubToken !== 'dummy-local-token') {
+            console.log('📡 Invoking Read-Only MCP Tools to fetch failure context...');
+            const mcpServer = (0, mcp_tools_1.createReadOnlyMcpServer)(octokit, {
+                owner,
+                repo,
+                runId,
+                pullNumber,
+                maxDiffLines
+            });
+            const logDataJson = await mcpServer.executeTool('get_failed_job_logs', {});
+            const logData = JSON.parse(logDataJson);
+            if (logData.jobName)
+                jobName = logData.jobName;
+            if (logData.errorLogWindow)
+                errorLogWindow = logData.errorLogWindow;
+            if (pullNumber) {
+                const diffDataJson = await mcpServer.executeTool('get_pull_request_diff', { maxLines: maxDiffLines });
+                const diffData = JSON.parse(diffDataJson);
+                if (diffData.diffSnippet)
+                    diffSnippet = diffData.diffSnippet;
+            }
+            const commitMetaJson = await mcpServer.executeTool('get_commit_metadata', {});
+            const commitMeta = JSON.parse(commitMetaJson);
+            if (commitMeta.commitSha)
+                commitSha = commitMeta.commitSha;
+            if (commitMeta.author)
+                author = commitMeta.author;
+            if (commitMeta.commitMessage)
+                commitMessage = commitMeta.commitMessage;
+        }
+        if (!errorLogWindow) {
+            errorLogWindow = '[Sample Error Log Window]\nError: Process completed with exit code 1.\nAssertionError: expected true to equal false\n  at UserServiceTest.ts:42';
+        }
+        // Step 2: Prepare Prompt from Template
+        const systemPrompt = (0, templates_1.getSystemPrompt)({
+            jobName,
+            commitSha: commitSha.substring(0, 7),
+            author
+        });
+        const promptPayload = `Failed Job Context:
+Job Name: ${jobName}
+Error Log Window:
+\`\`\`
+${errorLogWindow}
+\`\`\`
+
+Pull Request Diff Snippet:
+\`\`\`diff
+${diffSnippet}
+\`\`\`
+
+Commit Message: ${commitMessage}
+`;
+        // Handle --no-execute (Dry-run mode)
+        if (cliOptions.noExecute) {
+            console.log('\n--- [DRY-RUN SYSTEM PROMPT] ---');
+            console.log(systemPrompt);
+            console.log('\n--- [DRY-RUN SANITIZED PAYLOAD] ---');
+            console.log(promptPayload);
+            console.log('\n✅ Dry-run completed successfully. (No AI execution or PR comments made)');
+            return;
+        }
+        // Step 3: Run ACP Agent
         const mcpServer = (0, mcp_tools_1.createReadOnlyMcpServer)(octokit, {
             owner,
             repo,
@@ -30161,24 +30290,7 @@ async function run() {
             pullNumber,
             maxDiffLines
         });
-        // Step 2: Fetch Context Data via MCP Tools
-        core.info('📡 Invoking MCP Tools to gather failure context...');
-        const logDataJson = await mcpServer.executeTool('get_failed_job_logs', {});
-        const logData = JSON.parse(logDataJson);
-        if (logData.message && logData.message.includes('No failed jobs found')) {
-            core.info('✅ No failed jobs detected. Pipeline Assistant run complete.');
-            return;
-        }
-        let diffSnippet = 'N/A (No PR context)';
-        if (pullNumber) {
-            const diffDataJson = await mcpServer.executeTool('get_pull_request_diff', { maxLines: maxDiffLines });
-            const diffData = JSON.parse(diffDataJson);
-            diffSnippet = diffData.diffSnippet || 'No diff retrieved.';
-        }
-        const commitMetaJson = await mcpServer.executeTool('get_commit_metadata', {});
-        const commitMeta = JSON.parse(commitMetaJson);
-        // Step 3: Start ACP Agent Subprocess with MCP Server Hook
-        core.info(`🤖 Starting ACP Agent Process: ${agentCommand} ${agentArgs.join(' ')}`);
+        console.log(`🤖 Starting ACP Agent Process: ${agentCommand} ${agentArgs.join(' ')}`);
         const acpBridge = new acp_client_1.AcpClientBridge({
             workspacePath: process.cwd(),
             agentCommand,
@@ -30188,7 +30300,6 @@ async function run() {
         let markdownReport = '';
         try {
             await acpBridge.start();
-            // Step 4: Initialize Session & Send Diagnostic Prompt
             await acpBridge.sendRequest('initialize', {
                 protocolVersion: '1.0',
                 clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
@@ -30199,48 +30310,9 @@ async function run() {
                     mcpTools: mcpServer.listTools()
                 }
             });
-            core.info('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
-            const systemInstructions = `You are an expert DevOps and CI/CD triage assistant.
-Analyze the provided sanitized failure log and recent commit code diff.
-Diagnose the failure root cause and provide actionable guidance.
-
-Strict requirements:
-1. Provide a concise 2-3 sentence Root Cause diagnosis.
-2. Provide the exact Log Evidence (with relevant error line numbers).
-3. Provide a Suggested Fix with exact code or configuration snippet.
-4. Output cleanly in formatted Markdown matching this schema:
-
-### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`${logData.jobName || 'Unknown'}\`
-- **Commit**: \`${commitMeta.commitSha?.substring(0, 7) || 'N/A'}\` by \`${commitMeta.author || 'dev'}\`
-
-#### 🔍 Root Cause
-<Clear, actionable 2-sentence explanation>
-
-#### 📜 Log Evidence
-\`\`\`text
-<Relevant stack trace or error log snippet>
-\`\`\`
-
-#### 💡 Suggested Fix
-<Exact solution or code correction>
-`;
-            const promptPayload = `Failed Job Context:
-Job Name: ${logData.jobName}
-Error Log Window:
-\`\`\`
-${logData.errorLogWindow || 'No log window available'}
-\`\`\`
-
-Pull Request Diff Snippet:
-\`\`\`diff
-${diffSnippet}
-\`\`\`
-
-Commit Message: ${commitMeta.commitMessage}
-`;
+            console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
             const promptResponse = await acpBridge.sendRequest('agent/prompt', {
-                system: systemInstructions,
+                system: systemPrompt,
                 prompt: promptPayload
             });
             markdownReport = promptResponse?.content || promptResponse?.result?.content || promptResponse?.text || '';
@@ -30250,30 +30322,25 @@ Commit Message: ${commitMeta.commitMessage}
         }
         catch (acpErr) {
             const error = acpErr;
-            core.warning(`ACP Agent prompt execution note: ${error.message}`);
-            // Clean fallback formatting if ACP server runs in headless non-interactive mode
-            markdownReport = `### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`${logData.jobName || 'CI'}\`
-- **Commit**: \`${commitMeta.commitSha?.substring(0, 7) || 'Latest'}\` by \`${commitMeta.author || 'Author'}\`
-
-#### 🔍 Root Cause
-Analysis of the job logs identified failure during execution. Inspect the error log extract below.
-
-#### 📜 Log Evidence
-\`\`\`text
-${logData.errorLogWindow || 'Error log extract unavailable'}
-\`\`\`
-
-#### 💡 Suggested Fix
-Check latest commit changes against the failed assertions or permission constraints.`;
+            console.warn(`[ACP Process Notification] ${error.message}`);
+            markdownReport = (0, templates_1.formatReportTemplate)({
+                jobName,
+                commitSha: commitSha.substring(0, 7),
+                author,
+                rootCause: 'Analysis of the failure logs identified build or test errors. Inspect the extract below.',
+                logEvidence: errorLogWindow,
+                suggestedFix: 'Review the failing lines in the commit diff against the assertion requirements.'
+            });
         }
         finally {
             acpBridge.stop();
         }
-        // Step 5: Post or Update Comment on Pull Request (Idempotent)
-        if (pullNumber && markdownReport) {
-            core.info(`💬 Posting diagnostic report to PR #${pullNumber}...`);
-            const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & MCP.*`;
+        console.log('\n--- [GENERATED MARKDOWN REPORT] ---');
+        console.log(markdownReport);
+        // Step 4: Post or Update Comment on Pull Request (if in CI and pullNumber present)
+        if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
+            console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
+            const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & Read-Only MCP.*`;
             const comments = await octokit.rest.issues.listComments({
                 owner,
                 repo,
@@ -30287,7 +30354,7 @@ Check latest commit changes against the failed assertions or permission constrai
                     comment_id: existingComment.id,
                     body: fullCommentBody
                 });
-                core.info(`🔄 Updated existing comment #${existingComment.id}`);
+                console.log(`🔄 Updated existing comment #${existingComment.id}`);
             }
             else {
                 await octokit.rest.issues.createComment({
@@ -30296,13 +30363,12 @@ Check latest commit changes against the failed assertions or permission constrai
                     issue_number: pullNumber,
                     body: fullCommentBody
                 });
-                core.info('✨ Created new PR comment with failure diagnosis.');
+                console.log('✨ Created new PR comment with failure diagnosis.');
             }
         }
-        // Step 6: Set Outputs
-        core.setOutput('failed-job-name', logData.jobName || '');
+        core.setOutput('failed-job-name', jobName);
         core.setOutput('analysis-report', markdownReport);
-        core.info('🎉 Pipeline Assistant completed successfully.');
+        console.log('🎉 Pipeline Assistant completed successfully.');
     }
     catch (error) {
         const err = error;
@@ -30512,6 +30578,118 @@ function extractErrorLogWindow(fullLog, windowLines = 80) {
     const start = Math.max(0, targetIndex - Math.floor(windowLines / 2));
     const end = Math.min(lines.length, targetIndex + Math.floor(windowLines / 2));
     return lines.slice(start, end).join('\n');
+}
+
+
+/***/ }),
+
+/***/ 3340:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getSystemPrompt = getSystemPrompt;
+exports.formatReportTemplate = formatReportTemplate;
+const fs = __importStar(__nccwpck_require__(9896));
+const path = __importStar(__nccwpck_require__(6928));
+function getSystemPrompt(variables = {}) {
+    const templatePath = path.join(__dirname, '../templates/system-prompt.txt');
+    let content = '';
+    if (fs.existsSync(templatePath)) {
+        content = fs.readFileSync(templatePath, 'utf8');
+    }
+    else {
+        // Fallback embedded prompt if running in standalone bundled dist
+        content = `You are an expert DevOps and CI/CD triage assistant.
+Analyze the provided sanitized failure log and recent commit code diff.
+Diagnose the failure root cause and provide actionable guidance.
+
+Strict requirements:
+1. Provide a concise 2-3 sentence Root Cause diagnosis.
+2. Provide the exact Log Evidence (with relevant error line numbers).
+3. Provide a Suggested Fix with exact code or configuration snippet.
+4. Output cleanly in formatted Markdown matching this schema:
+
+### ❌ Pipeline Failure Analysis
+- **Failed Job**: \`{{jobName}}\`
+- **Commit**: \`{{commitSha}}\` by \`{{author}}\`
+
+#### 🔍 Root Cause
+<Clear, actionable 2-sentence explanation>
+
+#### 📜 Log Evidence
+\`\`\`text
+<Relevant stack trace or error log snippet>
+\`\`\`
+
+#### 💡 Suggested Fix
+<Exact solution or code correction>`;
+    }
+    for (const [key, value] of Object.entries(variables)) {
+        content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
+    }
+    return content;
+}
+function formatReportTemplate(variables) {
+    const templatePath = path.join(__dirname, '../templates/report-template.md');
+    let content = '';
+    if (fs.existsSync(templatePath)) {
+        content = fs.readFileSync(templatePath, 'utf8');
+    }
+    else {
+        content = `### ❌ Pipeline Failure Analysis
+- **Failed Job**: \`{{jobName}}\`
+- **Commit**: \`{{commitSha}}\` by \`{{author}}\`
+
+#### 🔍 Root Cause
+{{rootCause}}
+
+#### 📜 Log Evidence
+\`\`\`text
+{{logEvidence}}
+\`\`\`
+
+#### 💡 Suggested Fix
+{{suggestedFix}}`;
+    }
+    for (const [key, value] of Object.entries(variables)) {
+        content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
+    }
+    return content;
 }
 
 
