@@ -96,12 +96,22 @@ export class AcpClientBridge {
         // Handle streaming response updates from the agent
         if (msg.method === 'session/update' || msg.method === 'notifications/message') {
           const params = msg.params as any;
-          if (params?.update?.agent_message_chunk?.text) {
-            this.activeSessionTextBuffer += params.update.agent_message_chunk.text;
+          const update = params?.update;
+
+          // Copilot ACP: agent_message_chunk delivers text at update.content.text
+          if (update?.sessionUpdate === 'agent_message_chunk' && update?.content?.text) {
+            this.activeSessionTextBuffer += update.content.text;
+          // Legacy / alternative agents: text at params.update.agent_message_chunk.text
+          } else if (update?.agent_message_chunk?.text) {
+            this.activeSessionTextBuffer += update.agent_message_chunk.text;
+          // Flat text on params
           } else if (params?.text) {
             this.activeSessionTextBuffer += params.text;
+          // Flat content on params
           } else if (params?.content) {
-            this.activeSessionTextBuffer += typeof params.content === 'string' ? params.content : JSON.stringify(params.content);
+            this.activeSessionTextBuffer += typeof params.content === 'string'
+              ? params.content
+              : JSON.stringify(params.content);
           }
           return;
         }
@@ -160,6 +170,18 @@ export class AcpClientBridge {
           jsonrpc: '2.0',
           id: reqId,
           result: { success: false, reason }
+        });
+      }
+      return;
+    }
+
+    // Tools discovery — agent calls this to learn what MCP tools are available
+    if (method === 'tools/list') {
+      if (reqId !== undefined) {
+        this.sendResponse({
+          jsonrpc: '2.0',
+          id: reqId,
+          result: { tools: this.mcpServer.listTools() }
         });
       }
       return;

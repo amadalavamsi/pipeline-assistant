@@ -56,6 +56,16 @@ export function createReadOnlyMcpServer(
         type: 'object',
         properties: {}
       }
+    },
+    {
+      name: 'get_latest_commit_diff',
+      description: 'Fetch the sanitized file diff of the latest commit on the current workflow run. Use this for push-triggered runs where no pull request is available.',
+      parameters: {
+        type: 'object',
+        properties: {
+          maxLines: { type: 'number', description: 'Max diff lines to retrieve' }
+        }
+      }
     }
   ];
 
@@ -167,6 +177,45 @@ export function createReadOnlyMcpServer(
             const error = err as Error;
             ProtocolLogger.mcpToolError(name, error.message);
             return JSON.stringify({ error: `Failed to fetch commit metadata: ${error.message}` });
+          }
+        }
+
+        case 'get_latest_commit_diff': {
+          try {
+            // Fetch the head SHA from the workflow run
+            const run = await octokit.rest.actions.getWorkflowRun({
+              owner: context.owner,
+              repo: context.repo,
+              run_id: context.runId
+            });
+            const headSha = run.data.head_sha;
+
+            // Fetch the commit diff via the commits API (works without a PR)
+            const commitResponse = await octokit.rest.repos.getCommit({
+              owner: context.owner,
+              repo: context.repo,
+              ref: headSha,
+              mediaType: { format: 'diff' }
+            });
+
+            const maxLines = (args.maxLines as number) || context.maxDiffLines;
+            const rawDiff = String(commitResponse.data);
+            const sanitized = sanitizeText(rawDiff);
+            const diffLines = sanitized.split('\n');
+            const limitedDiff = diffLines.slice(0, maxLines).join('\n');
+
+            const result = JSON.stringify({
+              commitSha: headSha,
+              totalLines: diffLines.length,
+              diffSnippet: limitedDiff
+            });
+
+            ProtocolLogger.mcpToolResult(name, `Fetched commit diff for ${headSha.substring(0, 7)} (${diffLines.length} lines, capped to ${maxLines})`, result.length);
+            return result;
+          } catch (err: unknown) {
+            const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
+            return JSON.stringify({ error: `Failed to fetch commit diff: ${error.message}` });
           }
         }
 
