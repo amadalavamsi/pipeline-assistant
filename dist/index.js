@@ -30350,7 +30350,8 @@ Commit Message: ${commitMessage}
             let sessionId = 'default-session';
             try {
                 const sessionRes = await acpBridge.sendRequest('session/new', {
-                    cwd: process.cwd()
+                    cwd: process.cwd(),
+                    mcpServers: []
                 });
                 if (sessionRes?.sessionId) {
                     sessionId = sessionRes.sessionId;
@@ -30376,7 +30377,7 @@ Commit Message: ${commitMessage}
             }
             catch {
                 // Fallback for agents that expect agent/prompt or prompt
-                promptResponse = await acpBridge.sendRequest('agent/prompt', {
+                promptResponse = await acpBridge.sendRequest('session/prompt', {
                     sessionId,
                     system: systemPrompt,
                     prompt: promptPayload
