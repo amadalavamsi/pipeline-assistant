@@ -29931,7 +29931,7 @@ function wrappy (fn, cb) {
  * ACP (Agent Client Protocol) Bridge Engine
  * Handles JSON-RPC 2.0 connection to the ACP Agent runner (GitHub Copilot ACP server).
  * Strictly enforces Read-Only execution, zero bash terminal execution, and zero file modification.
- * Features comprehensive logging for every inbound and outbound message.
+ * Features full streaming aggregation for session/update notifications and session/prompt.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.AcpClientBridge = void 0;
@@ -29943,6 +29943,7 @@ class AcpClientBridge {
     messageIdCounter = 1;
     pendingRequests = new Map();
     mcpServer;
+    activeSessionTextBuffer = '';
     constructor(config) {
         this.config = config;
         this.mcpServer = config.mcpServer;
@@ -29992,9 +29993,23 @@ class AcpClientBridge {
                 }
                 return;
             }
-            // Request from Agent to Client (e.g. tool execution, permission, file edit)
+            // Notification or Request from Agent to Client
             if (msg.method) {
                 logger_1.ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
+                // Handle streaming response updates from the agent
+                if (msg.method === 'session/update' || msg.method === 'notifications/message') {
+                    const params = msg.params;
+                    if (params?.update?.agent_message_chunk?.text) {
+                        this.activeSessionTextBuffer += params.update.agent_message_chunk.text;
+                    }
+                    else if (params?.text) {
+                        this.activeSessionTextBuffer += params.text;
+                    }
+                    else if (params?.content) {
+                        this.activeSessionTextBuffer += typeof params.content === 'string' ? params.content : JSON.stringify(params.content);
+                    }
+                    return;
+                }
                 this.handleAgentRequest(msg);
             }
         }
@@ -30002,11 +30017,20 @@ class AcpClientBridge {
             // Ignore unparseable non-JSON-RPC lines
         }
     }
+    getStreamedText() {
+        return this.activeSessionTextBuffer;
+    }
+    clearStreamedText() {
+        this.activeSessionTextBuffer = '';
+    }
     async handleAgentRequest(req) {
         const method = req.method;
         const reqId = req.id;
         // Security Gate 1: Deny any bash / shell command execution requests
-        if (method === 'client/requestPermission' || method === 'client/runCommand' || method === 'terminal/execute') {
+        if (method === 'client/requestPermission' ||
+            method === 'client/runCommand' ||
+            method === 'terminal/execute' ||
+            method === 'session/request_permission') {
             const reason = 'Terminal execution is strictly disabled in CI/CD analysis mode.';
             logger_1.ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
             if (reqId !== undefined) {
@@ -30019,7 +30043,10 @@ class AcpClientBridge {
             return;
         }
         // Security Gate 2: Deny any file write / code modifications
-        if (method === 'client/applyEdit' || method === 'workspace/applyEdit' || method === 'fs/write') {
+        if (method === 'client/applyEdit' ||
+            method === 'workspace/applyEdit' ||
+            method === 'fs/write' ||
+            method === 'session/apply_edit') {
             const reason = 'File modification is disabled in Read-Only analysis mode.';
             logger_1.ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
             if (reqId !== undefined) {
@@ -30070,13 +30097,13 @@ class AcpClientBridge {
         return new Promise((resolve, reject) => {
             this.pendingRequests.set(id, { resolve, reject });
             this.sendMessage(message);
-            // Safety timeout: 45 seconds
+            // Safety timeout: 60 seconds
             setTimeout(() => {
                 if (this.pendingRequests.has(id)) {
                     this.pendingRequests.delete(id);
-                    reject(new Error(`ACP Request "${method}" timed out after 45s.`));
+                    reject(new Error(`ACP Request "${method}" timed out after 60s.`));
                 }
-            }, 45000);
+            }, 60000);
         });
     }
     sendMessage(msg) {
@@ -30307,6 +30334,7 @@ Commit Message: ${commitMessage}
         let markdownReport = '';
         try {
             await acpBridge.start();
+            // Step 3a: Initialize Protocol
             await acpBridge.sendRequest('initialize', {
                 protocolVersion: 1,
                 clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
@@ -30317,12 +30345,50 @@ Commit Message: ${commitMessage}
                     mcpTools: mcpServer.listTools()
                 }
             });
+            // Step 3b: Create Session (ACP Standard)
+            console.log('🔄 Creating new ACP Session (session/new)...');
+            let sessionId = 'default-session';
+            try {
+                const sessionRes = await acpBridge.sendRequest('session/new', {
+                    cwd: process.cwd()
+                });
+                if (sessionRes?.sessionId) {
+                    sessionId = sessionRes.sessionId;
+                }
+            }
+            catch (sessErr) {
+                console.warn(`[ACP Notice] session/new fallback to direct prompt: ${sessErr.message}`);
+            }
             console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
-            const promptResponse = await acpBridge.sendRequest('agent/prompt', {
-                system: systemPrompt,
-                prompt: promptPayload
-            });
-            markdownReport = promptResponse?.content || promptResponse?.result?.content || promptResponse?.text || '';
+            acpBridge.clearStreamedText();
+            // Step 3c: Send Prompt via session/prompt (or fallback to agent/prompt)
+            let promptResponse = null;
+            try {
+                promptResponse = await acpBridge.sendRequest('session/prompt', {
+                    sessionId,
+                    content: [
+                        {
+                            type: 'text',
+                            text: `${systemPrompt}\n\n${promptPayload}`
+                        }
+                    ]
+                });
+            }
+            catch {
+                // Fallback for agents that expect agent/prompt or prompt
+                promptResponse = await acpBridge.sendRequest('agent/prompt', {
+                    sessionId,
+                    system: systemPrompt,
+                    prompt: promptPayload
+                });
+            }
+            const streamedText = acpBridge.getStreamedText();
+            markdownReport =
+                streamedText ||
+                    promptResponse?.content ||
+                    promptResponse?.result?.content ||
+                    promptResponse?.text ||
+                    '';
             if (typeof markdownReport === 'object') {
                 markdownReport = JSON.stringify(markdownReport, null, 2);
             }
@@ -30730,33 +30796,28 @@ function getSystemPrompt(variables = {}) {
     if (fs.existsSync(templatePath)) {
         content = fs.readFileSync(templatePath, 'utf8');
     }
-    else {
-        // Fallback embedded prompt if running in standalone bundled dist
-        content = `You are an expert DevOps and CI/CD triage assistant.
-Analyze the provided sanitized failure log and recent commit code diff.
-Diagnose the failure root cause and provide actionable guidance.
-
-Strict requirements:
-1. Provide a concise 2-3 sentence Root Cause diagnosis.
-2. Provide the exact Log Evidence (with relevant error line numbers).
-3. Provide a Suggested Fix with exact code or configuration snippet.
-4. Output cleanly in formatted Markdown matching this schema:
-
-### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`{{jobName}}\`
-- **Commit**: \`{{commitSha}}\` by \`{{author}}\`
-
-#### 🔍 Root Cause
-<Clear, actionable 2-sentence explanation>
-
-#### 📜 Log Evidence
-\`\`\`text
-<Relevant stack trace or error log snippet>
-\`\`\`
-
-#### 💡 Suggested Fix
-<Exact solution or code correction>`;
-    }
+    //   } else {
+    //     // Fallback embedded prompt if running in standalone bundled dist
+    //     content = `You are an expert DevOps and CI/CD triage assistant.
+    // Analyze the provided sanitized failure log and recent commit code diff.
+    // Diagnose the failure root cause and provide actionable guidance.
+    // Strict requirements:
+    // 1. Provide a concise 2-3 sentence Root Cause diagnosis.
+    // 2. Provide the exact Log Evidence (with relevant error line numbers).
+    // 3. Provide a Suggested Fix with exact code or configuration snippet.
+    // 4. Output cleanly in formatted Markdown matching this schema:
+    // ### ❌ Pipeline Failure Analysis
+    // - **Failed Job**: \`{{jobName}}\`
+    // - **Commit**: \`{{commitSha}}\` by \`{{author}}\`
+    // #### 🔍 Root Cause
+    // <Clear, actionable 2-sentence explanation>
+    // #### 📜 Log Evidence
+    // \`\`\`text
+    // <Relevant stack trace or error log snippet>
+    // \`\`\`
+    // #### 💡 Suggested Fix
+    // <Exact solution or code correction>`;
+    //   }
     for (const [key, value] of Object.entries(variables)) {
         content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
     }

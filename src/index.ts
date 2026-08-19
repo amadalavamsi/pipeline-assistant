@@ -144,6 +144,7 @@ Commit Message: ${commitMessage}
     try {
       await acpBridge.start();
 
+      // Step 3a: Initialize Protocol
       await acpBridge.sendRequest('initialize', {
         protocolVersion: 1,
         clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
@@ -155,13 +156,52 @@ Commit Message: ${commitMessage}
         }
       });
 
-      console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
-      const promptResponse = await acpBridge.sendRequest('agent/prompt', {
-        system: systemPrompt,
-        prompt: promptPayload
-      });
+      // Step 3b: Create Session (ACP Standard)
+      console.log('🔄 Creating new ACP Session (session/new)...');
+      let sessionId = 'default-session';
+      try {
+        const sessionRes = await acpBridge.sendRequest('session/new', {
+          cwd: process.cwd()
+        });
+        if (sessionRes?.sessionId) {
+          sessionId = sessionRes.sessionId;
+        }
+      } catch (sessErr: unknown) {
+        console.warn(`[ACP Notice] session/new fallback to direct prompt: ${(sessErr as Error).message}`);
+      }
 
-      markdownReport = promptResponse?.content || promptResponse?.result?.content || promptResponse?.text || '';
+      console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
+      acpBridge.clearStreamedText();
+
+      // Step 3c: Send Prompt via session/prompt (or fallback to agent/prompt)
+      let promptResponse: any = null;
+      try {
+        promptResponse = await acpBridge.sendRequest('session/prompt', {
+          sessionId,
+          content: [
+            {
+              type: 'text',
+              text: `${systemPrompt}\n\n${promptPayload}`
+            }
+          ]
+        });
+      } catch {
+        // Fallback for agents that expect agent/prompt or prompt
+        promptResponse = await acpBridge.sendRequest('agent/prompt', {
+          sessionId,
+          system: systemPrompt,
+          prompt: promptPayload
+        });
+      }
+
+      const streamedText = acpBridge.getStreamedText();
+      markdownReport =
+        streamedText ||
+        promptResponse?.content ||
+        promptResponse?.result?.content ||
+        promptResponse?.text ||
+        '';
+
       if (typeof markdownReport === 'object') {
         markdownReport = JSON.stringify(markdownReport, null, 2);
       }

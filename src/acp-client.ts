@@ -2,7 +2,7 @@
  * ACP (Agent Client Protocol) Bridge Engine
  * Handles JSON-RPC 2.0 connection to the ACP Agent runner (GitHub Copilot ACP server).
  * Strictly enforces Read-Only execution, zero bash terminal execution, and zero file modification.
- * Features comprehensive logging for every inbound and outbound message.
+ * Features full streaming aggregation for session/update notifications and session/prompt.
  */
 
 import { spawn, ChildProcess } from 'child_process';
@@ -30,6 +30,7 @@ export class AcpClientBridge {
   private messageIdCounter = 1;
   private pendingRequests = new Map<number | string, { resolve: (val: any) => void; reject: (err: any) => void }>();
   private mcpServer: ReadOnlyMcpServer;
+  private activeSessionTextBuffer: string = '';
 
   constructor(private config: AcpSessionConfig) {
     this.mcpServer = config.mcpServer;
@@ -88,9 +89,23 @@ export class AcpClientBridge {
         return;
       }
 
-      // Request from Agent to Client (e.g. tool execution, permission, file edit)
+      // Notification or Request from Agent to Client
       if (msg.method) {
         ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
+
+        // Handle streaming response updates from the agent
+        if (msg.method === 'session/update' || msg.method === 'notifications/message') {
+          const params = msg.params as any;
+          if (params?.update?.agent_message_chunk?.text) {
+            this.activeSessionTextBuffer += params.update.agent_message_chunk.text;
+          } else if (params?.text) {
+            this.activeSessionTextBuffer += params.text;
+          } else if (params?.content) {
+            this.activeSessionTextBuffer += typeof params.content === 'string' ? params.content : JSON.stringify(params.content);
+          }
+          return;
+        }
+
         this.handleAgentRequest(msg);
       }
     } catch {
@@ -98,12 +113,25 @@ export class AcpClientBridge {
     }
   }
 
+  public getStreamedText(): string {
+    return this.activeSessionTextBuffer;
+  }
+
+  public clearStreamedText(): void {
+    this.activeSessionTextBuffer = '';
+  }
+
   private async handleAgentRequest(req: JsonRpcMessage): Promise<void> {
     const method = req.method;
     const reqId = req.id;
 
     // Security Gate 1: Deny any bash / shell command execution requests
-    if (method === 'client/requestPermission' || method === 'client/runCommand' || method === 'terminal/execute') {
+    if (
+      method === 'client/requestPermission' ||
+      method === 'client/runCommand' ||
+      method === 'terminal/execute' ||
+      method === 'session/request_permission'
+    ) {
       const reason = 'Terminal execution is strictly disabled in CI/CD analysis mode.';
       ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
 
@@ -118,7 +146,12 @@ export class AcpClientBridge {
     }
 
     // Security Gate 2: Deny any file write / code modifications
-    if (method === 'client/applyEdit' || method === 'workspace/applyEdit' || method === 'fs/write') {
+    if (
+      method === 'client/applyEdit' ||
+      method === 'workspace/applyEdit' ||
+      method === 'fs/write' ||
+      method === 'session/apply_edit'
+    ) {
       const reason = 'File modification is disabled in Read-Only analysis mode.';
       ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
 
@@ -175,13 +208,13 @@ export class AcpClientBridge {
       this.pendingRequests.set(id, { resolve, reject });
       this.sendMessage(message);
 
-      // Safety timeout: 45 seconds
+      // Safety timeout: 60 seconds
       setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
-          reject(new Error(`ACP Request "${method}" timed out after 45s.`));
+          reject(new Error(`ACP Request "${method}" timed out after 60s.`));
         }
-      }, 45000);
+      }, 60000);
     });
   }
 
