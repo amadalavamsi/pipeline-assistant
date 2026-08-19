@@ -1,0 +1,35 @@
+name: 'Pipeline Assistant: CI/CD Failure Triage'
+description: 'Automated CI/CD failure root-cause analysis powered by GitHub Copilot ACP and read-only MCP tools.'
+author: 'amadalavamsi'
+
+branding:
+  icon: 'alert-triangle'
+  color: 'blue'
+
+inputs:
+  github-token:
+    description: 'GitHub token for fetching logs, PR diffs, and posting comments'
+    required: false
+    default: '${{ github.token }}'
+  agent-command:
+    description: 'The ACP Agent executable command to launch'
+    required: false
+    default: 'copilot'
+  agent-args:
+    description: 'Arguments passed to the ACP Agent executable'
+    required: false
+    default: 'acp-server'
+  max-diff-lines:
+    description: 'Max lines of PR diff to send to the ACP agent (prevents token exhaustion)'
+    required: false
+    default: '2000'
+
+outputs:
+  failed-job-name:
+    description: 'The name of the failed job analyzed'
+  analysis-report:
+    description: 'The complete generated Markdown root-cause analysis report'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

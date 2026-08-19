@@ -1,0 +1,34 @@
+{
+  "name": "pipeline-assistant",
+  "version": "1.0.0",
+  "description": "GitHub Action: Automated CI/CD failure root-cause analysis powered by GitHub Copilot ACP and MCP read-only tools",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
+    "typecheck": "tsc --noEmit",
+    "test": "node dist/index.js"
+  },
+  "keywords": [
+    "github-action",
+    "acp",
+    "agent-client-protocol",
+    "mcp",
+    "model-context-protocol",
+    "ci-cd",
+    "copilot",
+    "devops"
+  ],
+  "author": "Vamsi Amadala <amadalavamsi@gmail.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@actions/core": "^1.10.1",
+    "@actions/github": "^6.0.0",
+    "@agentclientprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vercel/ncc": "^0.38.1",
+    "typescript": "^5.5.0"
+  }
+}
