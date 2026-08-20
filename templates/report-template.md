@@ -1,14 +1,14 @@
-### ❌ Pipeline Failure Analysis
+## ❌ Pipeline Failure Analysis
 - **Failed Job**: `{{jobName}}`
 - **Commit**: `{{commitSha}}` by `{{author}}`
 
-#### 📜 Error Log
+### 📜 Error Log
 ```text
 {{logEvidence}}
 ```
 
-#### 🔍 Root Cause
+### 🔍 Root Cause
 {{rootCause}}
 
-#### 💡 Suggested Fix
+### 💡 Suggested Fix
 {{suggestedFix}}

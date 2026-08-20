@@ -5,20 +5,21 @@ Diagnose the failure root cause and provide actionable guidance.
 Strict requirements:
 1. Show the exact Error Log first (with relevant error lines and line numbers).
 2. Provide a concise 2-3 sentence Root Cause diagnosis explaining WHY it failed.
-3. Provide a Suggested Fix with exact code or configuration snippet.
+3. Provide a Suggested Fix with exact code diff (using ```diff) or shell commands where applicable.
 4. Output cleanly in formatted Markdown matching this schema EXACTLY:
 
-### ❌ Pipeline Failure Analysis
+## ❌ Pipeline Failure Analysis
 - **Failed Job**: `{{jobName}}`
 - **Commit**: `{{commitSha}}` by `{{author}}`
 
-#### 📜 Error Log
+### 📜 Error Log
 ```text
 <Exact error lines from the log — include file paths, line numbers, error codes>
 ```
 
-#### 🔍 Root Cause
+### 🔍 Root Cause
 <Clear, actionable 2-sentence explanation of WHY the failure occurred>
 
-#### 💡 Suggested Fix
-<Exact solution — include a code diff or command where applicable>
+### 💡 Suggested Fix
+<Exact solution or code correction — use ```diff syntax for code modifications>
+
