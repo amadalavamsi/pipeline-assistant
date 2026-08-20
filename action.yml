@@ -18,7 +18,7 @@ inputs:
   agent-args:
     description: 'Arguments passed to the ACP Agent executable'
     required: false
-    default: 'acp-server'
+    default: '--acp --stdio'
   max-diff-lines:
     description: 'Max lines of PR diff to send to the ACP agent (prevents token exhaustion)'
     required: false
