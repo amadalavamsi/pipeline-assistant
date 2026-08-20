@@ -22,7 +22,7 @@ import { sanitizeText, extractErrorLogWindow } from './sanitizer';
 import { ProtocolLogger } from './logger';
 import { writeJobSummary, emitPrAnnotations } from './reporter';
 import { ACP_CAPABILITIES, BOT_COMMENT_SIGNATURE, JOB_NAME, FALLBACK } from './config';
-import { buildLiveCiUserPrompt, buildOfflineUserPrompt } from './prompts';
+import { buildLiveCiUserPromptWithData, buildOfflineUserPrompt } from './prompts';
 
 async function run(): Promise<void> {
   try {
@@ -88,6 +88,10 @@ async function run(): Promise<void> {
     // Step 3: Build system prompt and user prompt
     // System prompt → templates/system-prompt.txt (single source of truth)
     // User prompt   → src/prompts.ts (pure builder functions, no inline strings here)
+    //
+    // Architecture note: The copilot CLI manages its own tool ecosystem (github-mcp-server)
+    // and does NOT call back to our in-process MCP bridge. We pre-fetch all GitHub data
+    // here via octokit and embed it directly in the prompt instead.
     // -----------------------------------------------------------------------
     const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
     const hasPullRequest = Boolean(pullNumber);
@@ -98,13 +102,89 @@ async function run(): Promise<void> {
       author: 'developer'
     });
 
-    const userPrompt = isLiveCi
-      ? buildLiveCiUserPrompt({ owner, repo, runId, hasPullRequest, pullNumber })
-      : buildOfflineUserPrompt({
-          errorLog: offlineErrorLog,
-          diffSnippet: offlineDiffSnippet,
-          jobName: JOB_NAME
+    let userPrompt: string;
+
+    if (isLiveCi) {
+      console.log('📡 Pre-fetching GitHub data (logs, diff, metadata)...');
+
+      // --- Fetch commit metadata ---
+      let commitSha = 'HEAD';
+      let commitMessage = '';
+      let commitAuthor = 'developer';
+      let jobName = JOB_NAME;
+      try {
+        const run = await octokit.rest.actions.getWorkflowRun({
+          owner, repo, run_id: runId
         });
+        commitSha = run.data.head_sha || 'HEAD';
+        commitMessage = run.data.head_commit?.message || '';
+        commitAuthor = run.data.head_commit?.author?.name || 'developer';
+        console.log(`  ✅ Commit: ${commitSha.substring(0, 7)} by ${commitAuthor}`);
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch commit metadata: ${(e as Error).message}`);
+      }
+
+      // --- Fetch failed job logs ---
+      let errorLog = '';
+      try {
+        const jobsRes = await octokit.rest.actions.listJobsForWorkflowRun({
+          owner, repo, run_id: runId
+        });
+        const failedJob = jobsRes.data.jobs.find(
+          j => j.conclusion === 'failure' || j.status === 'in_progress'
+        );
+        if (failedJob) {
+          jobName = failedJob.name;
+          const logsRes = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
+            owner, repo, job_id: failedJob.id
+          });
+          errorLog = extractErrorLogWindow(sanitizeText(String(logsRes.data)), 120);
+          console.log(`  ✅ Logs: fetched error window for job "${failedJob.name}"`);
+        } else {
+          console.warn('  ⚠️ No failed job found in workflow run.');
+        }
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch job logs: ${(e as Error).message}`);
+      }
+
+      // --- Fetch code diff ---
+      let diffSnippet = '';
+      try {
+        if (hasPullRequest && pullNumber) {
+          const diffRes = await octokit.rest.pulls.get({
+            owner, repo, pull_number: pullNumber,
+            mediaType: { format: 'diff' }
+          });
+          diffSnippet = sanitizeText(String(diffRes.data))
+            .split('\n').slice(0, maxDiffLines).join('\n');
+          console.log('  ✅ Diff: fetched PR diff');
+        } else {
+          const commitRes = await octokit.rest.repos.getCommit({
+            owner, repo, ref: commitSha,
+            mediaType: { format: 'diff' }
+          });
+          diffSnippet = sanitizeText(String(commitRes.data))
+            .split('\n').slice(0, maxDiffLines).join('\n');
+          console.log('  ✅ Diff: fetched commit diff');
+        }
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch diff: ${(e as Error).message}`);
+      }
+
+      userPrompt = buildLiveCiUserPromptWithData({
+        owner, repo, runId,
+        commitSha, commitMessage, author: commitAuthor,
+        jobName, errorLog, diffSnippet,
+        hasPullRequest, pullNumber
+      });
+    } else {
+      userPrompt = buildOfflineUserPrompt({
+        errorLog: offlineErrorLog,
+        diffSnippet: offlineDiffSnippet,
+        jobName: JOB_NAME
+      });
+    }
+
 
     // -----------------------------------------------------------------------
     // Step 4: Handle --no-execute (dry-run mode)

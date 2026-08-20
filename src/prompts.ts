@@ -5,8 +5,11 @@
  * Prompt engineers edit ONLY this file — never index.ts.
  *
  * Two modes:
- *   buildLiveCiUserPrompt  — for live GitHub Actions runs (agent calls MCP tools at inference time)
- *   buildOfflineUserPrompt — for local CLI testing (pre-read file data injected directly)
+ *   buildLiveCiUserPromptWithData — live CI runs: data pre-fetched by index.ts, embedded directly
+ *   buildOfflineUserPrompt        — local CLI testing: data from --log-file / --diff-file flags
+ *
+ * NOTE: The copilot CLI manages its own tool ecosystem (github-mcp-server) and does NOT
+ * call back to our in-process MCP bridge. Pre-embedding all data is the correct architecture.
  */
 
 // ---------------------------------------------------------------------------
@@ -14,63 +17,81 @@
 // ---------------------------------------------------------------------------
 
 export interface LiveCiContext {
-  /** GitHub repository owner (org or username) */
   owner: string;
-  /** GitHub repository name */
   repo: string;
-  /** GitHub Actions workflow run ID */
   runId: number;
-  /** True when this run is associated with an open pull request */
   hasPullRequest: boolean;
-  /** Pull request number (present only when hasPullRequest is true) */
+  pullNumber?: number;
+}
+
+export interface LiveCiDataContext {
+  owner: string;
+  repo: string;
+  runId: number;
+  commitSha: string;
+  commitMessage: string;
+  author: string;
+  jobName: string;
+  errorLog: string;
+  diffSnippet: string;
+  hasPullRequest: boolean;
   pullNumber?: number;
 }
 
 export interface OfflineContext {
-  /** Pre-sanitized error log window from a local log file */
   errorLog: string;
-  /** Pre-sanitized diff snippet from a local diff file */
   diffSnippet: string;
-  /** Job name to include in the prompt */
   jobName: string;
 }
 
 // ---------------------------------------------------------------------------
-// Live CI prompt
+// Live CI prompt with pre-fetched data (primary mode)
 // ---------------------------------------------------------------------------
 
 /**
- * Build the user prompt for a live GitHub Actions run.
+ * Build the user prompt for a live CI run with ALL data pre-fetched and embedded.
  *
- * The agent is instructed to call MCP tools at inference time to gather
- * the real failure log, commit metadata, and code diff before writing the report.
+ * This avoids requiring the ACP agent to make MCP tool calls back to our
+ * in-process server. The copilot CLI manages its own tool ecosystem
+ * (github-mcp-server) and does NOT call back to our bridge's tools/list endpoint.
+ * Pre-embedding the data is the correct headless/CI architecture.
  */
-export function buildLiveCiUserPrompt(ctx: LiveCiContext): string {
-  const { owner, repo, runId, hasPullRequest, pullNumber } = ctx;
-
-  const diffToolLine = hasPullRequest
-    ? `- \`get_pull_request_diff\` — fetches the PR code diff (pull request #${pullNumber} is open)`
-    : `- \`get_latest_commit_diff\` — fetches the diff of the latest commit (no PR associated with this run)`;
+export function buildLiveCiUserPromptWithData(ctx: LiveCiDataContext): string {
+  const { owner, repo, runId, commitSha, commitMessage, author, jobName,
+          errorLog, diffSnippet, hasPullRequest, pullNumber } = ctx;
 
   const prLine = hasPullRequest
     ? `- Pull Request: #${pullNumber}`
     : `- Trigger: push (no PR)`;
 
+  const diffSection = diffSnippet
+    ? `\`\`\`diff\n${diffSnippet}\n\`\`\``
+    : '_No diff available for this run._';
+
+  const errorSection = errorLog
+    ? `\`\`\`text\n${errorLog}\n\`\`\``
+    : '_No error log available._';
+
   return `You are analysing a failed GitHub Actions workflow run.
+All evidence has been pre-fetched for you below — do NOT attempt to call any external tools.
 
-Available MCP tools you MUST call to gather evidence before writing your report:
-- \`get_failed_job_logs\` — fetches sanitized logs from the failed job
-- \`get_commit_metadata\` — fetches the commit SHA, author, and commit message
-${diffToolLine}
-
-Workflow context:
+## Workflow Context
 - Repository: ${owner}/${repo}
 - Run ID: ${runId}
+- Failed Job: \`${jobName}\`
+- Commit: \`${commitSha.substring(0, 7)}\` by ${author}
+- Commit Message: ${commitMessage || '(none)'}
 ${prLine}
 
-Instructions:
-1. Call the MCP tools listed above to collect the failure log, commit metadata, and code diff.
-2. Analyse the data you retrieve.
+## Failure Log (sanitized, error window)
+${errorSection}
+
+## Code Diff (latest commit)
+${diffSection}
+
+## Instructions
+1. Analyse the failure log and code diff provided above.
+2. Identify the root cause of the pipeline failure.
 3. Output your report strictly in the Markdown schema defined in the system prompt.`;
 }
 
@@ -80,9 +101,7 @@ Instructions:
 
 /**
  * Build the user prompt for local CLI testing.
- *
  * Pre-read file contents are injected directly; no MCP tool calls are made.
- * Typically used with --log-file and --diff-file CLI flags.
  */
 export function buildOfflineUserPrompt(ctx: OfflineContext): string {
   const { errorLog, diffSnippet, jobName } = ctx;
@@ -106,4 +125,10 @@ ${diffSection}
 \`\`\`
 
 Commit Message: Local CLI trigger`;
+}
+
+// Keep for backwards compatibility / legacy references
+export function buildLiveCiUserPrompt(ctx: LiveCiContext): string {
+  return `[Legacy prompt — use buildLiveCiUserPromptWithData instead]
+Repository: ${ctx.owner}/${ctx.repo}, Run: ${ctx.runId}`;
 }

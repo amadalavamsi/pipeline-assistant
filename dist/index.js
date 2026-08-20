@@ -30377,6 +30377,10 @@ async function run() {
         // Step 3: Build system prompt and user prompt
         // System prompt → templates/system-prompt.txt (single source of truth)
         // User prompt   → src/prompts.ts (pure builder functions, no inline strings here)
+        //
+        // Architecture note: The copilot CLI manages its own tool ecosystem (github-mcp-server)
+        // and does NOT call back to our in-process MCP bridge. We pre-fetch all GitHub data
+        // here via octokit and embed it directly in the prompt instead.
         // -----------------------------------------------------------------------
         const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
         const hasPullRequest = Boolean(pullNumber);
@@ -30385,13 +30389,87 @@ async function run() {
             commitSha: 'HEAD',
             author: 'developer'
         });
-        const userPrompt = isLiveCi
-            ? (0, prompts_1.buildLiveCiUserPrompt)({ owner, repo, runId, hasPullRequest, pullNumber })
-            : (0, prompts_1.buildOfflineUserPrompt)({
+        let userPrompt;
+        if (isLiveCi) {
+            console.log('📡 Pre-fetching GitHub data (logs, diff, metadata)...');
+            // --- Fetch commit metadata ---
+            let commitSha = 'HEAD';
+            let commitMessage = '';
+            let commitAuthor = 'developer';
+            let jobName = config_1.JOB_NAME;
+            try {
+                const run = await octokit.rest.actions.getWorkflowRun({
+                    owner, repo, run_id: runId
+                });
+                commitSha = run.data.head_sha || 'HEAD';
+                commitMessage = run.data.head_commit?.message || '';
+                commitAuthor = run.data.head_commit?.author?.name || 'developer';
+                console.log(`  ✅ Commit: ${commitSha.substring(0, 7)} by ${commitAuthor}`);
+            }
+            catch (e) {
+                console.warn(`  ⚠️ Could not fetch commit metadata: ${e.message}`);
+            }
+            // --- Fetch failed job logs ---
+            let errorLog = '';
+            try {
+                const jobsRes = await octokit.rest.actions.listJobsForWorkflowRun({
+                    owner, repo, run_id: runId
+                });
+                const failedJob = jobsRes.data.jobs.find(j => j.conclusion === 'failure' || j.status === 'in_progress');
+                if (failedJob) {
+                    jobName = failedJob.name;
+                    const logsRes = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
+                        owner, repo, job_id: failedJob.id
+                    });
+                    errorLog = (0, sanitizer_1.extractErrorLogWindow)((0, sanitizer_1.sanitizeText)(String(logsRes.data)), 120);
+                    console.log(`  ✅ Logs: fetched error window for job "${failedJob.name}"`);
+                }
+                else {
+                    console.warn('  ⚠️ No failed job found in workflow run.');
+                }
+            }
+            catch (e) {
+                console.warn(`  ⚠️ Could not fetch job logs: ${e.message}`);
+            }
+            // --- Fetch code diff ---
+            let diffSnippet = '';
+            try {
+                if (hasPullRequest && pullNumber) {
+                    const diffRes = await octokit.rest.pulls.get({
+                        owner, repo, pull_number: pullNumber,
+                        mediaType: { format: 'diff' }
+                    });
+                    diffSnippet = (0, sanitizer_1.sanitizeText)(String(diffRes.data))
+                        .split('\n').slice(0, maxDiffLines).join('\n');
+                    console.log('  ✅ Diff: fetched PR diff');
+                }
+                else {
+                    const commitRes = await octokit.rest.repos.getCommit({
+                        owner, repo, ref: commitSha,
+                        mediaType: { format: 'diff' }
+                    });
+                    diffSnippet = (0, sanitizer_1.sanitizeText)(String(commitRes.data))
+                        .split('\n').slice(0, maxDiffLines).join('\n');
+                    console.log('  ✅ Diff: fetched commit diff');
+                }
+            }
+            catch (e) {
+                console.warn(`  ⚠️ Could not fetch diff: ${e.message}`);
+            }
+            userPrompt = (0, prompts_1.buildLiveCiUserPromptWithData)({
+                owner, repo, runId,
+                commitSha, commitMessage, author: commitAuthor,
+                jobName, errorLog, diffSnippet,
+                hasPullRequest, pullNumber
+            });
+        }
+        else {
+            userPrompt = (0, prompts_1.buildOfflineUserPrompt)({
                 errorLog: offlineErrorLog,
                 diffSnippet: offlineDiffSnippet,
                 jobName: config_1.JOB_NAME
             });
+        }
         // -----------------------------------------------------------------------
         // Step 4: Handle --no-execute (dry-run mode)
         // -----------------------------------------------------------------------
@@ -30894,44 +30972,58 @@ function createReadOnlyMcpServer(octokit, context) {
  * Prompt engineers edit ONLY this file — never index.ts.
  *
  * Two modes:
- *   buildLiveCiUserPrompt  — for live GitHub Actions runs (agent calls MCP tools at inference time)
- *   buildOfflineUserPrompt — for local CLI testing (pre-read file data injected directly)
+ *   buildLiveCiUserPromptWithData — live CI runs: data pre-fetched by index.ts, embedded directly
+ *   buildOfflineUserPrompt        — local CLI testing: data from --log-file / --diff-file flags
+ *
+ * NOTE: The copilot CLI manages its own tool ecosystem (github-mcp-server) and does NOT
+ * call back to our in-process MCP bridge. Pre-embedding all data is the correct architecture.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.buildLiveCiUserPrompt = buildLiveCiUserPrompt;
+exports.buildLiveCiUserPromptWithData = buildLiveCiUserPromptWithData;
 exports.buildOfflineUserPrompt = buildOfflineUserPrompt;
+exports.buildLiveCiUserPrompt = buildLiveCiUserPrompt;
 // ---------------------------------------------------------------------------
-// Live CI prompt
+// Live CI prompt with pre-fetched data (primary mode)
 // ---------------------------------------------------------------------------
 /**
- * Build the user prompt for a live GitHub Actions run.
+ * Build the user prompt for a live CI run with ALL data pre-fetched and embedded.
  *
- * The agent is instructed to call MCP tools at inference time to gather
- * the real failure log, commit metadata, and code diff before writing the report.
+ * This avoids requiring the ACP agent to make MCP tool calls back to our
+ * in-process server. The copilot CLI manages its own tool ecosystem
+ * (github-mcp-server) and does NOT call back to our bridge's tools/list endpoint.
+ * Pre-embedding the data is the correct headless/CI architecture.
  */
-function buildLiveCiUserPrompt(ctx) {
-    const { owner, repo, runId, hasPullRequest, pullNumber } = ctx;
-    const diffToolLine = hasPullRequest
-        ? `- \`get_pull_request_diff\` — fetches the PR code diff (pull request #${pullNumber} is open)`
-        : `- \`get_latest_commit_diff\` — fetches the diff of the latest commit (no PR associated with this run)`;
+function buildLiveCiUserPromptWithData(ctx) {
+    const { owner, repo, runId, commitSha, commitMessage, author, jobName, errorLog, diffSnippet, hasPullRequest, pullNumber } = ctx;
     const prLine = hasPullRequest
         ? `- Pull Request: #${pullNumber}`
         : `- Trigger: push (no PR)`;
+    const diffSection = diffSnippet
+        ? `\`\`\`diff\n${diffSnippet}\n\`\`\``
+        : '_No diff available for this run._';
+    const errorSection = errorLog
+        ? `\`\`\`text\n${errorLog}\n\`\`\``
+        : '_No error log available._';
     return `You are analysing a failed GitHub Actions workflow run.
+All evidence has been pre-fetched for you below — do NOT attempt to call any external tools.
 
-Available MCP tools you MUST call to gather evidence before writing your report:
-- \`get_failed_job_logs\` — fetches sanitized logs from the failed job
-- \`get_commit_metadata\` — fetches the commit SHA, author, and commit message
-${diffToolLine}
-
-Workflow context:
+## Workflow Context
 - Repository: ${owner}/${repo}
 - Run ID: ${runId}
+- Failed Job: \`${jobName}\`
+- Commit: \`${commitSha.substring(0, 7)}\` by ${author}
+- Commit Message: ${commitMessage || '(none)'}
 ${prLine}
 
-Instructions:
-1. Call the MCP tools listed above to collect the failure log, commit metadata, and code diff.
-2. Analyse the data you retrieve.
+## Failure Log (sanitized, error window)
+${errorSection}
+
+## Code Diff (latest commit)
+${diffSection}
+
+## Instructions
+1. Analyse the failure log and code diff provided above.
+2. Identify the root cause of the pipeline failure.
 3. Output your report strictly in the Markdown schema defined in the system prompt.`;
 }
 // ---------------------------------------------------------------------------
@@ -30939,9 +31031,7 @@ Instructions:
 // ---------------------------------------------------------------------------
 /**
  * Build the user prompt for local CLI testing.
- *
  * Pre-read file contents are injected directly; no MCP tool calls are made.
- * Typically used with --log-file and --diff-file CLI flags.
  */
 function buildOfflineUserPrompt(ctx) {
     const { errorLog, diffSnippet, jobName } = ctx;
@@ -30962,6 +31052,11 @@ ${diffSection}
 \`\`\`
 
 Commit Message: Local CLI trigger`;
+}
+// Keep for backwards compatibility / legacy references
+function buildLiveCiUserPrompt(ctx) {
+    return `[Legacy prompt — use buildLiveCiUserPromptWithData instead]
+Repository: ${ctx.owner}/${ctx.repo}, Run: ${ctx.runId}`;
 }
 
 
