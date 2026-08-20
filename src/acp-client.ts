@@ -66,8 +66,25 @@ export class AcpClientBridge {
     });
 
     this.process.on('error', (err) => {
-      console.warn(`[ACP Process Notice] ${err.message}`);
+      console.error(`[ACP Process Error] Failed to launch agent: ${err.message}`);
+      this._rejectAllPending(`ACP agent process error: ${err.message}`);
     });
+
+    this.process.on('close', (code, signal) => {
+      if (this.pendingRequests.size > 0) {
+        const reason = `ACP agent process exited unexpectedly (code=${code}, signal=${signal}). ` +
+          `Ensure the agent command is installed and accessible on PATH in the runner.`;
+        console.error(`[ACP Process Error] ${reason}`);
+        this._rejectAllPending(reason);
+      }
+    });
+  }
+
+  private _rejectAllPending(reason: string): void {
+    for (const [id, handler] of this.pendingRequests) {
+      this.pendingRequests.delete(id);
+      handler.reject(new Error(reason));
+    }
   }
 
   private handleIncomingMessage(rawJson: string): void {
