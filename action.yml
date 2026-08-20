@@ -19,6 +19,14 @@ inputs:
     description: 'Arguments passed to the ACP Agent executable'
     required: false
     default: '--acp --stdio'
+  run-id:
+    description: 'The workflow run ID to analyse (defaults to github.event.workflow_run.id when triggered by workflow_run, or the current run ID otherwise)'
+    required: false
+    default: ''
+  repository:
+    description: 'The repository to analyse in owner/repo format (defaults to current repo)'
+    required: false
+    default: ''
   max-diff-lines:
     description: 'Max lines of PR diff to send to the ACP agent (prevents token exhaustion)'
     required: false

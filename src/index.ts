@@ -36,10 +36,48 @@ async function run(): Promise<void> {
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
 
-    const owner = cliOptions.owner || context.repo?.owner || process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
-    const repo = cliOptions.repo || context.repo?.repo || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[1] : 'local-repo');
-    const runId = cliOptions.runId || context.runId || 0;
-    const pullNumber = cliOptions.pullNumber || context.payload?.pull_request?.number;
+    // -----------------------------------------------------------------------
+    // Resolve the TARGET run — the failing CI job we are analysing.
+    //
+    // Priority for run-id:
+    //   1. Explicit `run-id` action input  (most reliable — set by workflow_run caller)
+    //   2. github.event.workflow_run.id    (auto-populated when triggered by workflow_run)
+    //   3. cliOptions.runId               (local CLI --run-id flag)
+    //   4. context.runId                  (fallback — this is the ASSISTANT's own run ID,
+    //                                      only correct when triggered directly, not via workflow_run)
+    //
+    // Priority for owner/repo:
+    //   1. Explicit `repository` action input  (e.g. "org/repo")
+    //   2. github.event.workflow_run.repository (workflow_run context)
+    //   3. cliOptions / context.repo           (local CLI / direct trigger)
+    // -----------------------------------------------------------------------
+    const runIdInput = parseInt(core.getInput('run-id', { required: false }) || '0', 10);
+    const repoInput = core.getInput('repository', { required: false }) || '';
+
+    // github.event.workflow_run is populated when triggered by workflow_run
+    const workflowRunEvent = context.payload?.workflow_run as { id?: number; repository?: { owner?: { login?: string }; name?: string } } | undefined;
+
+    const runId = runIdInput ||
+                  workflowRunEvent?.id ||
+                  cliOptions.runId ||
+                  context.runId ||
+                  0;
+
+    let owner: string;
+    let repo: string;
+    if (repoInput && repoInput.includes('/')) {
+      [owner, repo] = repoInput.split('/');
+    } else if (workflowRunEvent?.repository) {
+      owner = workflowRunEvent.repository.owner?.login || context.repo?.owner || 'local-owner';
+      repo  = workflowRunEvent.repository.name        || context.repo?.repo  || 'local-repo';
+    } else {
+      owner = cliOptions.owner || context.repo?.owner || process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
+      repo  = cliOptions.repo  || context.repo?.repo  || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[1] : 'local-repo');
+    }
+
+    const pullNumber = cliOptions.pullNumber ||
+                       (workflowRunEvent as any)?.pull_requests?.[0]?.number ||
+                       context.payload?.pull_request?.number;
     const maxDiffLines = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
     const agentCommand = core.getInput('agent-command', { required: false }) || 'copilot';
     const agentArgsInput = core.getInput('agent-args', { required: false }) || ' --acp --stdio';
