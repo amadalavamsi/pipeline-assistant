@@ -1,0 +1,49 @@
+[
+  {
+    "name": "get_failed_job_logs",
+    "description": "Fetch the sanitized failure log context from the current workflow run.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "jobName": {
+          "type": "string",
+          "description": "Optional specific job name to filter"
+        }
+      }
+    }
+  },
+  {
+    "name": "get_pull_request_diff",
+    "description": "Fetch the sanitized git diff of the latest commit(s) in the pull request.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "maxLines": {
+          "type": "number",
+          "description": "Max diff lines to retrieve"
+        }
+      }
+    }
+  },
+  {
+    "name": "get_commit_metadata",
+    "description": "Retrieve metadata of the latest commit including author and commit message.",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "get_latest_commit_diff",
+    "description": "Fetch the sanitized file diff of the latest commit on the current workflow run. Use this for push-triggered runs where no pull request is available.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "maxLines": {
+          "type": "number",
+          "description": "Max diff lines to retrieve"
+        }
+      }
+    }
+  }
+]

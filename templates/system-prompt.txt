@@ -3,22 +3,22 @@ Analyze the provided sanitized failure log and recent commit code diff.
 Diagnose the failure root cause and provide actionable guidance.
 
 Strict requirements:
-1. Provide a concise 2-3 sentence Root Cause diagnosis.
-2. Provide the exact Log Evidence (with relevant error line numbers).
+1. Show the exact Error Log first (with relevant error lines and line numbers).
+2. Provide a concise 2-3 sentence Root Cause diagnosis explaining WHY it failed.
 3. Provide a Suggested Fix with exact code or configuration snippet.
-4. Output cleanly in formatted Markdown matching this schema:
+4. Output cleanly in formatted Markdown matching this schema EXACTLY:
 
 ### ❌ Pipeline Failure Analysis
 - **Failed Job**: `{{jobName}}`
 - **Commit**: `{{commitSha}}` by `{{author}}`
 
-#### 🔍 Root Cause
-<Clear, actionable 2-sentence explanation>
-
-#### 📜 Log Evidence
+#### 📜 Error Log
 ```text
-<Relevant stack trace or error log snippet>
+<Exact error lines from the log — include file paths, line numbers, error codes>
 ```
 
+#### 🔍 Root Cause
+<Clear, actionable 2-sentence explanation of WHY the failure occurred>
+
 #### 💡 Suggested Fix
-<Exact solution or code correction>
+<Exact solution — include a code diff or command where applicable>

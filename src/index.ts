@@ -1,3 +1,15 @@
+/**
+ * index.ts — Pipeline Assistant Orchestration
+ *
+ * This file contains ONLY execution flow. All configuration, prompts, and
+ * reporting logic live in dedicated modules:
+ *
+ *   src/config.ts   — ACP capabilities, MCP tool registry, agent defaults
+ *   src/prompts.ts  — User prompt builders (live-CI and offline)
+ *   src/templates.ts — System prompt & report template file readers
+ *   src/reporter.ts — Job Summary writer and PR annotation emitter
+ */
+
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as fs from 'fs';
@@ -8,8 +20,9 @@ import { parseCliArgs } from './cli-parser';
 import { getSystemPrompt, formatReportTemplate } from './templates';
 import { sanitizeText, extractErrorLogWindow } from './sanitizer';
 import { ProtocolLogger } from './logger';
-
-const BOT_COMMENT_SIGNATURE = '<!-- pipeline-assistant-report -->';
+import { writeJobSummary, emitPrAnnotations } from './reporter';
+import { ACP_CAPABILITIES, BOT_COMMENT_SIGNATURE, JOB_NAME, FALLBACK } from './config';
+import { buildLiveCiUserPrompt, buildOfflineUserPrompt } from './prompts';
 
 async function run(): Promise<void> {
   try {
@@ -41,6 +54,7 @@ async function run(): Promise<void> {
 
     // -----------------------------------------------------------------------
     // Step 1: Create a single MCP server instance (reused across the entire run)
+    // Tool registry loaded from config/mcp-tools.json via src/config.ts
     // -----------------------------------------------------------------------
     const mcpServer = createReadOnlyMcpServer(octokit, {
       owner,
@@ -72,61 +86,25 @@ async function run(): Promise<void> {
 
     // -----------------------------------------------------------------------
     // Step 3: Build system prompt and user prompt
-    // In live CI mode the prompt instructs the agent to call MCP tools itself.
-    // In offline/dry-run mode the pre-read file data is injected directly.
+    // System prompt → templates/system-prompt.txt (single source of truth)
+    // User prompt   → src/prompts.ts (pure builder functions, no inline strings here)
     // -----------------------------------------------------------------------
     const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
     const hasPullRequest = Boolean(pullNumber);
 
     const systemPrompt = getSystemPrompt({
-      jobName: 'CI-Job',
+      jobName: JOB_NAME,
       commitSha: 'HEAD',
       author: 'developer'
     });
 
-    let userPrompt: string;
-
-    if (isLiveCi) {
-      // Agent will call MCP tools at inference time to obtain the real data
-      userPrompt = `You are analysing a failed GitHub Actions workflow run.
-
-Available MCP tools you MUST call to gather evidence before writing your report:
-- \`get_failed_job_logs\` — fetches sanitized logs from the failed job
-- \`get_commit_metadata\` — fetches the commit SHA, author, and commit message
-${hasPullRequest
-          ? `- \`get_pull_request_diff\` — fetches the PR code diff (pull request #${pullNumber} is open)`
-          : `- \`get_latest_commit_diff\` — fetches the diff of the latest commit (no PR associated with this run)`
-        }
-
-Workflow context:
-- Repository: ${owner}/${repo}
-- Run ID: ${runId}
-${hasPullRequest ? `- Pull Request: #${pullNumber}` : '- Trigger: push (no PR)'}
-
-Instructions:
-1. Call the MCP tools listed above to collect the failure log, commit metadata, and code diff.
-2. Analyse the data you retrieve.
-3. Output your report strictly in the Markdown schema defined in the system prompt.`;
-    } else {
-      // Offline / local mode — inject pre-read file data directly
-      const errorLogSection = offlineErrorLog ||
-        '[Sample Error Log Window]\nError: Process completed with exit code 1.\nAssertionError: expected true to equal false\n  at UserServiceTest.ts:42';
-      const diffSection = offlineDiffSnippet || 'No diff available.';
-
-      userPrompt = `Failed Job Context:
-Job Name: CI-Job
-Error Log Window:
-\`\`\`
-${errorLogSection}
-\`\`\`
-
-Pull Request Diff Snippet:
-\`\`\`diff
-${diffSection}
-\`\`\`
-
-Commit Message: Local CLI trigger`;
-    }
+    const userPrompt = isLiveCi
+      ? buildLiveCiUserPrompt({ owner, repo, runId, hasPullRequest, pullNumber })
+      : buildOfflineUserPrompt({
+          errorLog: offlineErrorLog,
+          diffSnippet: offlineDiffSnippet,
+          jobName: JOB_NAME
+        });
 
     // -----------------------------------------------------------------------
     // Step 4: Handle --no-execute (dry-run mode)
@@ -157,15 +135,12 @@ Commit Message: Local CLI trigger`;
       await acpBridge.start();
 
       // Step 5a: Initialize Protocol
+      // ACP capabilities loaded from config/acp-capabilities.json — never edit here.
       // protocolVersion: integer (this agent validates it as a number type)
       await acpBridge.sendRequest('initialize', {
         protocolVersion: 1,
         clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
-        capabilities: {
-          readOnly: true,
-          terminalExecution: false,
-          fileModification: false
-        }
+        capabilities: ACP_CAPABILITIES
       });
 
       // Step 5b: Create Session
@@ -237,12 +212,12 @@ Commit Message: Local CLI trigger`;
       const error = acpErr as Error;
       console.warn(`[ACP Process Notification] ${error.message}`);
       markdownReport = formatReportTemplate({
-        jobName: 'CI-Job',
+        jobName: JOB_NAME,
         commitSha: 'N/A',
         author: 'N/A',
-        rootCause: 'Analysis of the failure logs identified build or test errors. Inspect the extract below.',
+        rootCause: FALLBACK.rootCause,
         logEvidence: offlineErrorLog || '(no log data available in fallback)',
-        suggestedFix: 'Review the failing lines in the commit diff against the assertion requirements.'
+        suggestedFix: FALLBACK.suggestedFix
       });
     } finally {
       acpBridge.stop();
@@ -257,12 +232,12 @@ Commit Message: Local CLI trigger`;
       console.warn('\n⚠️  [WARNING] Markdown report is empty — the ACP agent produced no output.');
       console.warn(`    Check the full debug log for details: ${ProtocolLogger.getLogFilePath()}`);
       markdownReport = formatReportTemplate({
-        jobName: 'CI-Job',
+        jobName: JOB_NAME,
         commitSha: 'N/A',
         author: 'N/A',
-        rootCause: 'ACP agent produced no output. The agent may have timed out or failed silently.',
+        rootCause: FALLBACK.noOutputRootCause,
         logEvidence: offlineErrorLog || '(no log data — check acp-debug.log)',
-        suggestedFix: `Review acp-debug.log for the full ACP protocol trace: ${ProtocolLogger.getLogFilePath()}`
+        suggestedFix: `${FALLBACK.noOutputSuggestedFix}: ${ProtocolLogger.getLogFilePath()}`
       });
     }
 
@@ -273,7 +248,33 @@ Commit Message: Local CLI trigger`;
     console.log(`\n📄 Report saved → ${reportFile}`);
 
     // -----------------------------------------------------------------------
-    // Step 6: Post or update the PR comment (live CI only)
+    // Step 7: Write GitHub Actions Job Summary (always — visible on the
+    //         failed-job Summary tab regardless of push vs PR strategy)
+    // -----------------------------------------------------------------------
+    const triggerLabel = pullNumber ? `PR #${pullNumber}` : (context.eventName || 'push');
+    try {
+      await writeJobSummary({
+        jobName: JOB_NAME,
+        commitSha: context.sha || 'HEAD',
+        author: context.actor || 'developer',
+        triggerLabel,
+        markdownReport
+      });
+    } catch (summaryErr: unknown) {
+      // Non-fatal: summary writing can fail outside GitHub Actions (e.g. local runs)
+      console.warn(`[summary] Could not write Job Summary: ${(summaryErr as Error).message}`);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 8: Emit inline PR annotations (only when a PR context exists)
+    //         Teams that push directly to main/master naturally skip this.
+    // -----------------------------------------------------------------------
+    if (pullNumber) {
+      emitPrAnnotations(markdownReport);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 9: Post or update the PR comment (live CI only)
     // -----------------------------------------------------------------------
     if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
       console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
@@ -306,7 +307,7 @@ Commit Message: Local CLI trigger`;
       }
     }
 
-    core.setOutput('failed-job-name', 'CI-Job');
+    core.setOutput('failed-job-name', JOB_NAME);
     core.setOutput('analysis-report', markdownReport);
     console.log('🎉 Pipeline Assistant completed successfully.');
 

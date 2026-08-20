@@ -30188,11 +30188,79 @@ function parseCliArgs(args) {
 
 /***/ }),
 
+/***/ 2973:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * config.ts
+ *
+ * Single typed import point for all external configuration.
+ * Every other module imports constants from HERE — never directly from JSON files.
+ *
+ * Config files live in: config/
+ *   acp-capabilities.json  — ACP security & permission flags
+ *   mcp-tools.json         — MCP tool registry (name / description / parameter schema)
+ *   agent.json             — default job name, fallback text
+ */
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.BOT_COMMENT_SIGNATURE = exports.FALLBACK = exports.JOB_NAME = exports.MCP_TOOL_REGISTRY = exports.ACP_CAPABILITIES = void 0;
+const acp_capabilities_json_1 = __importDefault(__nccwpck_require__(8280));
+const mcp_tools_json_1 = __importDefault(__nccwpck_require__(1265));
+const agent_json_1 = __importDefault(__nccwpck_require__(6098));
+/**
+ * Security & permission flags sent during the ACP `initialize` handshake.
+ * To add/remove a permission, edit config/acp-capabilities.json only.
+ * (_comment field is intentionally excluded from the exported type)
+ */
+exports.ACP_CAPABILITIES = {
+    readOnly: acp_capabilities_json_1.default.readOnly,
+    terminalExecution: acp_capabilities_json_1.default.terminalExecution,
+    fileModification: acp_capabilities_json_1.default.fileModification,
+    webSearch: acp_capabilities_json_1.default.webSearch
+};
+// ---------------------------------------------------------------------------
+// MCP Tool Registry
+// ---------------------------------------------------------------------------
+/**
+ * Declarative MCP tool definitions loaded from config/mcp-tools.json.
+ * The tool implementation (GitHub API calls) lives in mcp-tools.ts.
+ * To add a new tool: add an entry here AND a matching case in executeTool().
+ */
+exports.MCP_TOOL_REGISTRY = mcp_tools_json_1.default;
+// ---------------------------------------------------------------------------
+// Agent Defaults
+// ---------------------------------------------------------------------------
+/** Default job name used when one cannot be determined from the workflow run. */
+exports.JOB_NAME = agent_json_1.default.jobName;
+/** Fallback report text used when the ACP agent encounters an error or times out. */
+exports.FALLBACK = agent_json_1.default.fallback;
+/** Bot comment marker used to find and update existing PR comments. */
+exports.BOT_COMMENT_SIGNATURE = '<!-- pipeline-assistant-report -->';
+
+
+/***/ }),
+
 /***/ 9407:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+/**
+ * index.ts — Pipeline Assistant Orchestration
+ *
+ * This file contains ONLY execution flow. All configuration, prompts, and
+ * reporting logic live in dedicated modules:
+ *
+ *   src/config.ts   — ACP capabilities, MCP tool registry, agent defaults
+ *   src/prompts.ts  — User prompt builders (live-CI and offline)
+ *   src/templates.ts — System prompt & report template file readers
+ *   src/reporter.ts — Job Summary writer and PR annotation emitter
+ */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     var desc = Object.getOwnPropertyDescriptor(m, k);
@@ -30237,7 +30305,9 @@ const cli_parser_1 = __nccwpck_require__(6109);
 const templates_1 = __nccwpck_require__(3340);
 const sanitizer_1 = __nccwpck_require__(8820);
 const logger_1 = __nccwpck_require__(6999);
-const BOT_COMMENT_SIGNATURE = '<!-- pipeline-assistant-report -->';
+const reporter_1 = __nccwpck_require__(5622);
+const config_1 = __nccwpck_require__(2973);
+const prompts_1 = __nccwpck_require__(6224);
 async function run() {
     try {
         const cliOptions = (0, cli_parser_1.parseCliArgs)(process.argv.slice(2));
@@ -30262,6 +30332,7 @@ async function run() {
         }
         // -----------------------------------------------------------------------
         // Step 1: Create a single MCP server instance (reused across the entire run)
+        // Tool registry loaded from config/mcp-tools.json via src/config.ts
         // -----------------------------------------------------------------------
         const mcpServer = (0, mcp_tools_1.createReadOnlyMcpServer)(octokit, {
             owner,
@@ -30289,57 +30360,23 @@ async function run() {
         }
         // -----------------------------------------------------------------------
         // Step 3: Build system prompt and user prompt
-        // In live CI mode the prompt instructs the agent to call MCP tools itself.
-        // In offline/dry-run mode the pre-read file data is injected directly.
+        // System prompt → templates/system-prompt.txt (single source of truth)
+        // User prompt   → src/prompts.ts (pure builder functions, no inline strings here)
         // -----------------------------------------------------------------------
         const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
         const hasPullRequest = Boolean(pullNumber);
         const systemPrompt = (0, templates_1.getSystemPrompt)({
-            jobName: 'CI-Job',
+            jobName: config_1.JOB_NAME,
             commitSha: 'HEAD',
             author: 'developer'
         });
-        let userPrompt;
-        if (isLiveCi) {
-            // Agent will call MCP tools at inference time to obtain the real data
-            userPrompt = `You are analysing a failed GitHub Actions workflow run.
-
-Available MCP tools you MUST call to gather evidence before writing your report:
-- \`get_failed_job_logs\` — fetches sanitized logs from the failed job
-- \`get_commit_metadata\` — fetches the commit SHA, author, and commit message
-${hasPullRequest
-                ? `- \`get_pull_request_diff\` — fetches the PR code diff (pull request #${pullNumber} is open)`
-                : `- \`get_latest_commit_diff\` — fetches the diff of the latest commit (no PR associated with this run)`}
-
-Workflow context:
-- Repository: ${owner}/${repo}
-- Run ID: ${runId}
-${hasPullRequest ? `- Pull Request: #${pullNumber}` : '- Trigger: push (no PR)'}
-
-Instructions:
-1. Call the MCP tools listed above to collect the failure log, commit metadata, and code diff.
-2. Analyse the data you retrieve.
-3. Output your report strictly in the Markdown schema defined in the system prompt.`;
-        }
-        else {
-            // Offline / local mode — inject pre-read file data directly
-            const errorLogSection = offlineErrorLog ||
-                '[Sample Error Log Window]\nError: Process completed with exit code 1.\nAssertionError: expected true to equal false\n  at UserServiceTest.ts:42';
-            const diffSection = offlineDiffSnippet || 'No diff available.';
-            userPrompt = `Failed Job Context:
-Job Name: CI-Job
-Error Log Window:
-\`\`\`
-${errorLogSection}
-\`\`\`
-
-Pull Request Diff Snippet:
-\`\`\`diff
-${diffSection}
-\`\`\`
-
-Commit Message: Local CLI trigger`;
-        }
+        const userPrompt = isLiveCi
+            ? (0, prompts_1.buildLiveCiUserPrompt)({ owner, repo, runId, hasPullRequest, pullNumber })
+            : (0, prompts_1.buildOfflineUserPrompt)({
+                errorLog: offlineErrorLog,
+                diffSnippet: offlineDiffSnippet,
+                jobName: config_1.JOB_NAME
+            });
         // -----------------------------------------------------------------------
         // Step 4: Handle --no-execute (dry-run mode)
         // -----------------------------------------------------------------------
@@ -30365,15 +30402,12 @@ Commit Message: Local CLI trigger`;
         try {
             await acpBridge.start();
             // Step 5a: Initialize Protocol
+            // ACP capabilities loaded from config/acp-capabilities.json — never edit here.
             // protocolVersion: integer (this agent validates it as a number type)
             await acpBridge.sendRequest('initialize', {
                 protocolVersion: 1,
                 clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
-                capabilities: {
-                    readOnly: true,
-                    terminalExecution: false,
-                    fileModification: false
-                }
+                capabilities: config_1.ACP_CAPABILITIES
             });
             // Step 5b: Create Session
             // mcpServers must be empty — our MCP server is in-process and responds to
@@ -30437,12 +30471,12 @@ Commit Message: Local CLI trigger`;
             const error = acpErr;
             console.warn(`[ACP Process Notification] ${error.message}`);
             markdownReport = (0, templates_1.formatReportTemplate)({
-                jobName: 'CI-Job',
+                jobName: config_1.JOB_NAME,
                 commitSha: 'N/A',
                 author: 'N/A',
-                rootCause: 'Analysis of the failure logs identified build or test errors. Inspect the extract below.',
+                rootCause: config_1.FALLBACK.rootCause,
                 logEvidence: offlineErrorLog || '(no log data available in fallback)',
-                suggestedFix: 'Review the failing lines in the commit diff against the assertion requirements.'
+                suggestedFix: config_1.FALLBACK.suggestedFix
             });
         }
         finally {
@@ -30456,12 +30490,12 @@ Commit Message: Local CLI trigger`;
             console.warn('\n⚠️  [WARNING] Markdown report is empty — the ACP agent produced no output.');
             console.warn(`    Check the full debug log for details: ${logger_1.ProtocolLogger.getLogFilePath()}`);
             markdownReport = (0, templates_1.formatReportTemplate)({
-                jobName: 'CI-Job',
+                jobName: config_1.JOB_NAME,
                 commitSha: 'N/A',
                 author: 'N/A',
-                rootCause: 'ACP agent produced no output. The agent may have timed out or failed silently.',
+                rootCause: config_1.FALLBACK.noOutputRootCause,
                 logEvidence: offlineErrorLog || '(no log data — check acp-debug.log)',
-                suggestedFix: `Review acp-debug.log for the full ACP protocol trace: ${logger_1.ProtocolLogger.getLogFilePath()}`
+                suggestedFix: `${config_1.FALLBACK.noOutputSuggestedFix}: ${logger_1.ProtocolLogger.getLogFilePath()}`
             });
         }
         console.log('\n--- [GENERATED MARKDOWN REPORT] ---');
@@ -30469,17 +30503,42 @@ Commit Message: Local CLI trigger`;
         fs.writeFileSync(reportFile, markdownReport, 'utf8');
         console.log(`\n📄 Report saved → ${reportFile}`);
         // -----------------------------------------------------------------------
-        // Step 6: Post or update the PR comment (live CI only)
+        // Step 7: Write GitHub Actions Job Summary (always — visible on the
+        //         failed-job Summary tab regardless of push vs PR strategy)
+        // -----------------------------------------------------------------------
+        const triggerLabel = pullNumber ? `PR #${pullNumber}` : (context.eventName || 'push');
+        try {
+            await (0, reporter_1.writeJobSummary)({
+                jobName: config_1.JOB_NAME,
+                commitSha: context.sha || 'HEAD',
+                author: context.actor || 'developer',
+                triggerLabel,
+                markdownReport
+            });
+        }
+        catch (summaryErr) {
+            // Non-fatal: summary writing can fail outside GitHub Actions (e.g. local runs)
+            console.warn(`[summary] Could not write Job Summary: ${summaryErr.message}`);
+        }
+        // -----------------------------------------------------------------------
+        // Step 8: Emit inline PR annotations (only when a PR context exists)
+        //         Teams that push directly to main/master naturally skip this.
+        // -----------------------------------------------------------------------
+        if (pullNumber) {
+            (0, reporter_1.emitPrAnnotations)(markdownReport);
+        }
+        // -----------------------------------------------------------------------
+        // Step 9: Post or update the PR comment (live CI only)
         // -----------------------------------------------------------------------
         if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
             console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
-            const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & Read-Only MCP.*`;
+            const fullCommentBody = `${config_1.BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & Read-Only MCP.*`;
             const comments = await octokit.rest.issues.listComments({
                 owner,
                 repo,
                 issue_number: pullNumber
             });
-            const existingComment = comments.data.find(c => c.body?.includes(BOT_COMMENT_SIGNATURE));
+            const existingComment = comments.data.find(c => c.body?.includes(config_1.BOT_COMMENT_SIGNATURE));
             if (existingComment) {
                 await octokit.rest.issues.updateComment({
                     owner,
@@ -30499,7 +30558,7 @@ Commit Message: Local CLI trigger`;
                 console.log('✨ Created new PR comment with failure diagnosis.');
             }
         }
-        core.setOutput('failed-job-name', 'CI-Job');
+        core.setOutput('failed-job-name', config_1.JOB_NAME);
         core.setOutput('analysis-report', markdownReport);
         console.log('🎉 Pipeline Assistant completed successfully.');
     }
@@ -30647,56 +30706,28 @@ exports.ProtocolLogger = ProtocolLogger;
 "use strict";
 
 /**
- * In-Memory Read-Only MCP Server providing tools to read failed job logs and PR commit diffs.
- * Includes complete audit logging for every tool invocation and return payload.
+ * mcp-tools.ts
+ *
+ * In-Memory Read-Only MCP Server.
+ * - Tool REGISTRY (names, descriptions, parameter schemas) → loaded from config/mcp-tools.json
+ * - Tool IMPLEMENTATION (GitHub API calls)                → switch/case below
+ *
+ * To add a new tool:
+ *   1. Add its JSON descriptor to config/mcp-tools.json
+ *   2. Add a matching case in executeTool() below
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.createReadOnlyMcpServer = createReadOnlyMcpServer;
 const sanitizer_1 = __nccwpck_require__(8820);
 const logger_1 = __nccwpck_require__(6999);
+const config_1 = __nccwpck_require__(2973);
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
 function createReadOnlyMcpServer(octokit, context) {
-    const tools = [
-        {
-            name: 'get_failed_job_logs',
-            description: 'Fetch the sanitized failure log context from the current workflow run.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    jobName: { type: 'string', description: 'Optional specific job name to filter' }
-                }
-            }
-        },
-        {
-            name: 'get_pull_request_diff',
-            description: 'Fetch the sanitized git diff of the latest commit(s) in the pull request.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    maxLines: { type: 'number', description: 'Max diff lines to retrieve' }
-                }
-            }
-        },
-        {
-            name: 'get_commit_metadata',
-            description: 'Retrieve metadata of the latest commit including author and commit message.',
-            parameters: {
-                type: 'object',
-                properties: {}
-            }
-        },
-        {
-            name: 'get_latest_commit_diff',
-            description: 'Fetch the sanitized file diff of the latest commit on the current workflow run. Use this for push-triggered runs where no pull request is available.',
-            parameters: {
-                type: 'object',
-                properties: {
-                    maxLines: { type: 'number', description: 'Max diff lines to retrieve' }
-                }
-            }
-        }
-    ];
     return {
-        listTools: () => tools,
+        // Tool registry is served directly from config/mcp-tools.json
+        listTools: () => config_1.MCP_TOOL_REGISTRY,
         executeTool: async (name, args) => {
             logger_1.ProtocolLogger.mcpToolInvoked(name, args);
             switch (name) {
@@ -30746,9 +30777,7 @@ function createReadOnlyMcpServer(octokit, context) {
                             owner: context.owner,
                             repo: context.repo,
                             pull_number: context.pullNumber,
-                            mediaType: {
-                                format: 'diff'
-                            }
+                            mediaType: { format: 'diff' }
                         });
                         const rawDiff = String(diffResponse.data);
                         const sanitized = (0, sanitizer_1.sanitizeText)(rawDiff);
@@ -30833,6 +30862,365 @@ function createReadOnlyMcpServer(octokit, context) {
             }
         }
     };
+}
+
+
+/***/ }),
+
+/***/ 6224:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * prompts.ts
+ *
+ * All user-prompt construction logic lives here.
+ * Prompt engineers edit ONLY this file — never index.ts.
+ *
+ * Two modes:
+ *   buildLiveCiUserPrompt  — for live GitHub Actions runs (agent calls MCP tools at inference time)
+ *   buildOfflineUserPrompt — for local CLI testing (pre-read file data injected directly)
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.buildLiveCiUserPrompt = buildLiveCiUserPrompt;
+exports.buildOfflineUserPrompt = buildOfflineUserPrompt;
+// ---------------------------------------------------------------------------
+// Live CI prompt
+// ---------------------------------------------------------------------------
+/**
+ * Build the user prompt for a live GitHub Actions run.
+ *
+ * The agent is instructed to call MCP tools at inference time to gather
+ * the real failure log, commit metadata, and code diff before writing the report.
+ */
+function buildLiveCiUserPrompt(ctx) {
+    const { owner, repo, runId, hasPullRequest, pullNumber } = ctx;
+    const diffToolLine = hasPullRequest
+        ? `- \`get_pull_request_diff\` — fetches the PR code diff (pull request #${pullNumber} is open)`
+        : `- \`get_latest_commit_diff\` — fetches the diff of the latest commit (no PR associated with this run)`;
+    const prLine = hasPullRequest
+        ? `- Pull Request: #${pullNumber}`
+        : `- Trigger: push (no PR)`;
+    return `You are analysing a failed GitHub Actions workflow run.
+
+Available MCP tools you MUST call to gather evidence before writing your report:
+- \`get_failed_job_logs\` — fetches sanitized logs from the failed job
+- \`get_commit_metadata\` — fetches the commit SHA, author, and commit message
+${diffToolLine}
+
+Workflow context:
+- Repository: ${owner}/${repo}
+- Run ID: ${runId}
+${prLine}
+
+Instructions:
+1. Call the MCP tools listed above to collect the failure log, commit metadata, and code diff.
+2. Analyse the data you retrieve.
+3. Output your report strictly in the Markdown schema defined in the system prompt.`;
+}
+// ---------------------------------------------------------------------------
+// Offline / local CLI prompt
+// ---------------------------------------------------------------------------
+/**
+ * Build the user prompt for local CLI testing.
+ *
+ * Pre-read file contents are injected directly; no MCP tool calls are made.
+ * Typically used with --log-file and --diff-file CLI flags.
+ */
+function buildOfflineUserPrompt(ctx) {
+    const { errorLog, diffSnippet, jobName } = ctx;
+    const errorLogSection = errorLog ||
+        '[Sample Error Log Window]\nError: Process completed with exit code 1.\n' +
+            'AssertionError: expected true to equal false\n  at UserServiceTest.ts:42';
+    const diffSection = diffSnippet || 'No diff available.';
+    return `Failed Job Context:
+Job Name: ${jobName}
+Error Log Window:
+\`\`\`
+${errorLogSection}
+\`\`\`
+
+Pull Request Diff Snippet:
+\`\`\`diff
+${diffSection}
+\`\`\`
+
+Commit Message: Local CLI trigger`;
+}
+
+
+/***/ }),
+
+/***/ 5622:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * reporter.ts
+ *
+ * Handles two output channels for failure diagnostics:
+ *   1. GitHub Actions Job Summary  — always written, visible on the failed-job Summary tab.
+ *   2. Inline PR annotations       — emitted only when a pull-request context is present.
+ *
+ * Both functions consume the AI-generated markdown report from index.ts; no prompt changes needed.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parseAnnotations = parseAnnotations;
+exports.writeJobSummary = writeJobSummary;
+exports.emitPrAnnotations = emitPrAnnotations;
+const core = __importStar(__nccwpck_require__(7484));
+// ---------------------------------------------------------------------------
+// Annotation Parser
+// ---------------------------------------------------------------------------
+/**
+ * Scan an AI-generated markdown report for common compiler / runtime error
+ * file:line patterns and return structured annotations.
+ *
+ * Supported patterns:
+ *  - TypeScript / ESLint  : src/foo.ts:10:5 - error TS2345: …
+ *  - Python               : File "src/main.py", line 42
+ *  - Jest / Node stack    : at Object.<anonymous> (test/foo.test.js:42:5)
+ *  - Generic              : error at path/to/file.go:25
+ *
+ * Capped at 5 results (GitHub allows 10 annotations per step; buffer kept for safety).
+ */
+function parseAnnotations(text) {
+    const annotations = [];
+    const seen = new Set();
+    const patterns = [
+        // TypeScript/ESLint: src/foo.ts:10:5 - error TS2345: Argument of type …
+        {
+            regex: /([^\s"'`(]+\.[a-z]{2,5}):(\d+):\d+\s*[-–]\s*(error\s+\S+[^\n]*)/gi,
+            fileIdx: 1,
+            lineIdx: 2,
+            msgIdx: 3
+        },
+        // Python: File "src/main.py", line 42
+        {
+            regex: /File "([^"]+\.[a-z]{2,5})",\s*line\s+(\d+)/gi,
+            fileIdx: 1,
+            lineIdx: 2,
+            msgIdx: -1
+        },
+        // Jest / Node.js stack: at Object.<anonymous> (test/foo.test.js:42:5)
+        {
+            regex: /at\s+\S+\s+\(([^\s)]+\.[a-z]{2,5}):(\d+):\d+\)/gi,
+            fileIdx: 1,
+            lineIdx: 2,
+            msgIdx: -1
+        },
+        // Generic: Error at path/to/file.go:25
+        {
+            regex: /(?:error|Error|ERROR)\s+at\s+([^\s:]+\.[a-z]{2,5}):(\d+)/gi,
+            fileIdx: 1,
+            lineIdx: 2,
+            msgIdx: -1
+        }
+    ];
+    for (const { regex, fileIdx, lineIdx, msgIdx } of patterns) {
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            if (annotations.length >= 5)
+                break;
+            const file = match[fileIdx]?.trim();
+            const line = parseInt(match[lineIdx], 10);
+            if (!file || isNaN(line))
+                continue;
+            const dedupeKey = `${file}:${line}`;
+            if (seen.has(dedupeKey))
+                continue;
+            seen.add(dedupeKey);
+            const message = msgIdx >= 0 && match[msgIdx]
+                ? match[msgIdx].trim()
+                : `Failure detected at ${file}:${line}`;
+            annotations.push({ file, line, message });
+        }
+        if (annotations.length >= 5)
+            break;
+    }
+    return annotations;
+}
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+/**
+ * Extract the text body of a named section from the AI markdown report.
+ * Searches for any heading line that contains `sectionKeyword` and returns
+ * all content up to the next heading of the same or higher level.
+ */
+function extractSection(markdown, sectionKeyword) {
+    const lines = markdown.split('\n');
+    let capturing = false;
+    let captureLevel = 0;
+    const buffer = [];
+    for (const line of lines) {
+        const headingMatch = line.match(/^(#+)\s+(.*)/);
+        if (headingMatch) {
+            const level = headingMatch[1].length;
+            const title = headingMatch[2];
+            if (title.includes(sectionKeyword)) {
+                capturing = true;
+                captureLevel = level;
+                continue;
+            }
+            if (capturing && level <= captureLevel) {
+                // Reached the next sibling or parent heading — stop.
+                break;
+            }
+        }
+        if (capturing) {
+            buffer.push(line);
+        }
+    }
+    return buffer.join('\n').trim();
+}
+/**
+ * Strip markdown code fences (``` … ```) so the text can be embedded
+ * safely inside an HTML <pre><code> block in the Job Summary.
+ */
+function stripCodeFences(text) {
+    return text.replace(/```[a-z]*\n?/gi, '').trim();
+}
+/**
+ * Escape HTML special characters so raw text is safe inside HTML elements.
+ */
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+// ---------------------------------------------------------------------------
+// Job Summary writer
+// ---------------------------------------------------------------------------
+/**
+ * Write a rich GitHub Actions Job Summary to $GITHUB_STEP_SUMMARY.
+ *
+ * Output layout:
+ *  ┌──────────────────────────────────────────────────────────┐
+ *  │  ❌ Pipeline Failure Analysis                             │
+ *  ├──────────────┬──────────┬────────────┬───────────────────┤
+ *  │  Failed Job  │  Commit  │  Author    │  Trigger          │
+ *  ├──────────────┴──────────┴────────────┴───────────────────┤
+ *  │  🔍 Root Cause                                            │
+ *  │  <text>                                                   │
+ *  │  📜 Log Evidence (collapsible)                            │
+ *  │  💡 Suggested Fix                                         │
+ *  │  ─────────────────────────────────────────────────────── │
+ *  │  🤖 generated by pipeline-assistant                       │
+ *  └──────────────────────────────────────────────────────────┘
+ */
+async function writeJobSummary(params) {
+    const { jobName, commitSha, author, triggerLabel, markdownReport } = params;
+    const shortSha = commitSha !== 'N/A' && commitSha.length > 7
+        ? commitSha.substring(0, 7)
+        : commitSha;
+    // Pull named sections out of the AI report
+    const rootCause = extractSection(markdownReport, 'Root Cause') ||
+        '(See full report below)';
+    const rawLog = extractSection(markdownReport, 'Error Log') ||
+        extractSection(markdownReport, 'Log Evidence') ||
+        extractSection(markdownReport, 'Log');
+    const rawFix = extractSection(markdownReport, 'Suggested Fix') ||
+        extractSection(markdownReport, 'Fix');
+    const cleanLog = escapeHtml(stripCodeFences(rawLog));
+    const cleanFix = escapeHtml(stripCodeFences(rawFix));
+    // Log evidence goes in a collapsible <details> to keep the summary compact
+    const logHtml = cleanLog
+        ? `<details><summary>Click to expand log evidence</summary><pre><code>${cleanLog}</code></pre></details>`
+        : '<em>No log evidence extracted.</em>';
+    const fixHtml = cleanFix
+        ? `<pre><code>${cleanFix}</code></pre>`
+        : '<em>No specific fix suggested.</em>';
+    await core.summary
+        .addHeading('❌ Pipeline Failure Analysis', 1)
+        .addTable([
+        [
+            { data: 'Failed Job', header: true },
+            { data: 'Commit', header: true },
+            { data: 'Author', header: true },
+            { data: 'Trigger', header: true }
+        ],
+        [
+            `<code>${escapeHtml(jobName)}</code>`,
+            `<code>${escapeHtml(shortSha)}</code>`,
+            escapeHtml(author || '—'),
+            escapeHtml(triggerLabel)
+        ]
+    ])
+        .addHeading('🔍 Root Cause', 3)
+        .addRaw(`<p>${escapeHtml(rootCause)}</p>`)
+        .addHeading('📜 Log Evidence', 3)
+        .addRaw(logHtml)
+        .addHeading('💡 Suggested Fix', 3)
+        .addRaw(fixHtml)
+        .addSeparator()
+        .addRaw('<p><sub>🤖 Report generated by ' +
+        '<a href="https://github.com/amadalavamsi/pipeline-assistant">pipeline-assistant</a>' +
+        ' via ACP + Read-Only MCP</sub></p>')
+        .write();
+    core.info('[reporter] Job Summary written to $GITHUB_STEP_SUMMARY.');
+}
+// ---------------------------------------------------------------------------
+// PR annotation emitter
+// ---------------------------------------------------------------------------
+/**
+ * Emit inline code annotations on the PR diff for each file:line error found
+ * in the AI-generated report.
+ *
+ * ⚠️  Call this ONLY when a pull-request context is present (pullNumber is set).
+ *     For push-to-main triggers, skip this entirely — there is no PR diff to annotate.
+ */
+function emitPrAnnotations(markdownReport) {
+    const annotations = parseAnnotations(markdownReport);
+    if (annotations.length === 0) {
+        core.info('[reporter] No file:line patterns found in report — skipping PR annotations.');
+        return;
+    }
+    for (const annotation of annotations) {
+        core.error(annotation.message, {
+            title: '🤖 AI Root Cause',
+            file: annotation.file,
+            startLine: annotation.line
+        });
+    }
+    core.info(`[reporter] Emitted ${annotations.length} inline annotation(s) on PR diff.`);
 }
 
 
@@ -30959,37 +31347,11 @@ const fs = __importStar(__nccwpck_require__(9896));
 const path = __importStar(__nccwpck_require__(6928));
 function getSystemPrompt(variables = {}) {
     const templatePath = path.join(__dirname, '../templates/system-prompt.txt');
-    let content = '';
-    if (fs.existsSync(templatePath)) {
-        content = fs.readFileSync(templatePath, 'utf8');
+    if (!fs.existsSync(templatePath)) {
+        throw new Error(`[templates] system-prompt.txt not found at: ${templatePath}\n` +
+            `Ensure the templates/ directory is present alongside dist/.`);
     }
-    else {
-        // Fallback embedded prompt if running in standalone bundled dist
-        content = `You are an expert DevOps and CI/CD triage assistant.
-Analyze the provided sanitized failure log and recent commit code diff.
-Diagnose the failure root cause and provide actionable guidance.
-
-Strict requirements:
-1. Provide a concise 2-3 sentence Root Cause diagnosis.
-2. Provide the exact Log Evidence (with relevant error line numbers).
-3. Provide a Suggested Fix with exact code or configuration snippet.
-4. Output cleanly in formatted Markdown matching this schema:
-
-### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`{{jobName}}\`
-- **Commit**: \`{{commitSha}}\` by \`{{author}}\`
-
-#### 🔍 Root Cause
-<Clear, actionable 2-sentence explanation>
-
-#### 📜 Log Evidence
-\`\`\`text
-<Relevant stack trace or error log snippet>
-\`\`\`
-
-#### 💡 Suggested Fix
-<Exact solution or code correction>`;
-    }
+    let content = fs.readFileSync(templatePath, 'utf8');
     for (const [key, value] of Object.entries(variables)) {
         content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
     }
@@ -32896,6 +33258,30 @@ function parseParams (str) {
 
 module.exports = parseParams
 
+
+/***/ }),
+
+/***/ 8280:
+/***/ ((module) => {
+
+"use strict";
+module.exports = /*#__PURE__*/JSON.parse('{"_comment":"ACP protocol security & permission flags. Add or remove permissions here only — never touch index.ts.","readOnly":true,"terminalExecution":false,"fileModification":false,"webSearch":false}');
+
+/***/ }),
+
+/***/ 6098:
+/***/ ((module) => {
+
+"use strict";
+module.exports = /*#__PURE__*/JSON.parse('{"_comment":"Default values for the pipeline-assistant agent. Edit here — never hardcode in TypeScript.","jobName":"CI-Job","fallback":{"rootCause":"Analysis of the failure logs identified build or test errors. Inspect the extract below.","suggestedFix":"Review the failing lines in the commit diff against the assertion requirements.","noOutputRootCause":"ACP agent produced no output. The agent may have timed out or failed silently.","noOutputSuggestedFix":"Review acp-debug.log for the full ACP protocol trace."}}');
+
+/***/ }),
+
+/***/ 1265:
+/***/ ((module) => {
+
+"use strict";
+module.exports = /*#__PURE__*/JSON.parse('[{"name":"get_failed_job_logs","description":"Fetch the sanitized failure log context from the current workflow run.","parameters":{"type":"object","properties":{"jobName":{"type":"string","description":"Optional specific job name to filter"}}}},{"name":"get_pull_request_diff","description":"Fetch the sanitized git diff of the latest commit(s) in the pull request.","parameters":{"type":"object","properties":{"maxLines":{"type":"number","description":"Max diff lines to retrieve"}}}},{"name":"get_commit_metadata","description":"Retrieve metadata of the latest commit including author and commit message.","parameters":{"type":"object","properties":{}}},{"name":"get_latest_commit_diff","description":"Fetch the sanitized file diff of the latest commit on the current workflow run. Use this for push-triggered runs where no pull request is available.","parameters":{"type":"object","properties":{"maxLines":{"type":"number","description":"Max diff lines to retrieve"}}}}]');
 
 /***/ })
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "ACP protocol security & permission flags. Add or remove permissions here only — never touch index.ts.",
+  "readOnly": true,
+  "terminalExecution": false,
+  "fileModification": false,
+  "webSearch": false
+}

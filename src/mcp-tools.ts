@@ -1,11 +1,23 @@
 /**
- * In-Memory Read-Only MCP Server providing tools to read failed job logs and PR commit diffs.
- * Includes complete audit logging for every tool invocation and return payload.
+ * mcp-tools.ts
+ *
+ * In-Memory Read-Only MCP Server.
+ * - Tool REGISTRY (names, descriptions, parameter schemas) → loaded from config/mcp-tools.json
+ * - Tool IMPLEMENTATION (GitHub API calls)                → switch/case below
+ *
+ * To add a new tool:
+ *   1. Add its JSON descriptor to config/mcp-tools.json
+ *   2. Add a matching case in executeTool() below
  */
 
 import { getOctokit } from '@actions/github';
 import { sanitizeText, extractErrorLogWindow } from './sanitizer';
 import { ProtocolLogger } from './logger';
+import { MCP_TOOL_REGISTRY } from './config';
+
+// ---------------------------------------------------------------------------
+// Public interfaces
+// ---------------------------------------------------------------------------
 
 export interface McpToolDefinition {
   name: string;
@@ -18,6 +30,10 @@ export interface ReadOnlyMcpServer {
   executeTool(name: string, args: Record<string, unknown>): Promise<string>;
 }
 
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
 export function createReadOnlyMcpServer(
   octokit: ReturnType<typeof getOctokit>,
   context: {
@@ -28,49 +44,9 @@ export function createReadOnlyMcpServer(
     maxDiffLines: number;
   }
 ): ReadOnlyMcpServer {
-  const tools: McpToolDefinition[] = [
-    {
-      name: 'get_failed_job_logs',
-      description: 'Fetch the sanitized failure log context from the current workflow run.',
-      parameters: {
-        type: 'object',
-        properties: {
-          jobName: { type: 'string', description: 'Optional specific job name to filter' }
-        }
-      }
-    },
-    {
-      name: 'get_pull_request_diff',
-      description: 'Fetch the sanitized git diff of the latest commit(s) in the pull request.',
-      parameters: {
-        type: 'object',
-        properties: {
-          maxLines: { type: 'number', description: 'Max diff lines to retrieve' }
-        }
-      }
-    },
-    {
-      name: 'get_commit_metadata',
-      description: 'Retrieve metadata of the latest commit including author and commit message.',
-      parameters: {
-        type: 'object',
-        properties: {}
-      }
-    },
-    {
-      name: 'get_latest_commit_diff',
-      description: 'Fetch the sanitized file diff of the latest commit on the current workflow run. Use this for push-triggered runs where no pull request is available.',
-      parameters: {
-        type: 'object',
-        properties: {
-          maxLines: { type: 'number', description: 'Max diff lines to retrieve' }
-        }
-      }
-    }
-  ];
-
   return {
-    listTools: () => tools,
+    // Tool registry is served directly from config/mcp-tools.json
+    listTools: () => MCP_TOOL_REGISTRY,
 
     executeTool: async (name: string, args: Record<string, unknown>): Promise<string> => {
       ProtocolLogger.mcpToolInvoked(name, args);
@@ -131,9 +107,7 @@ export function createReadOnlyMcpServer(
               owner: context.owner,
               repo: context.repo,
               pull_number: context.pullNumber,
-              mediaType: {
-                format: 'diff'
-              }
+              mediaType: { format: 'diff' }
             });
 
             const rawDiff = String(diffResponse.data);

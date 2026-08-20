@@ -1,0 +1,10 @@
+{
+  "_comment": "Default values for the pipeline-assistant agent. Edit here — never hardcode in TypeScript.",
+  "jobName": "CI-Job",
+  "fallback": {
+    "rootCause": "Analysis of the failure logs identified build or test errors. Inspect the extract below.",
+    "suggestedFix": "Review the failing lines in the commit diff against the assertion requirements.",
+    "noOutputRootCause": "ACP agent produced no output. The agent may have timed out or failed silently.",
+    "noOutputSuggestedFix": "Review acp-debug.log for the full ACP protocol trace."
+  }
+}
