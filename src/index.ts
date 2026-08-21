@@ -1,15 +1,3 @@
-/**
- * index.ts — Pipeline Assistant Orchestration
- *
- * This file contains ONLY execution flow. All configuration, prompts, and
- * reporting logic live in dedicated modules:
- *
- *   src/config.ts   — ACP capabilities, MCP tool registry, agent defaults
- *   src/prompts.ts  — User prompt builders (live-CI and offline)
- *   src/templates.ts — System prompt & report template file readers
- *   src/reporter.ts — Job Summary writer and PR annotation emitter
- */
-
 import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as fs from 'fs';
@@ -18,20 +6,32 @@ import { createReadOnlyMcpServer } from './mcp-tools';
 import { AcpClientBridge } from './acp-client';
 import { parseCliArgs } from './cli-parser';
 import { getSystemPrompt, formatReportTemplate } from './templates';
-import { sanitizeText, extractErrorLogWindow } from './sanitizer';
+import { sanitizeText, extractErrorLogWindow, initializeEnvSecretMasking, registerSecret } from './sanitizer';
 import { ProtocolLogger } from './logger';
 import { writeJobSummary, emitPrAnnotations } from './reporter';
 import { ACP_CAPABILITIES, BOT_COMMENT_SIGNATURE, JOB_NAME, FALLBACK } from './config';
-import { buildLiveCiUserPromptWithData, buildOfflineUserPrompt } from './prompts';
+import { buildLiveCiUserPrompt, buildOfflineUserPrompt } from './prompts';
 
 async function run(): Promise<void> {
   try {
+    // -----------------------------------------------------------------------
+    // Security Step 0: Initialize secret masking across the process
+    // -----------------------------------------------------------------------
+    initializeEnvSecretMasking();
+
     const cliOptions = parseCliArgs(process.argv.slice(2));
 
     const githubToken =
       core.getInput('github-token', { required: false }) ||
       process.env.GITHUB_TOKEN ||
       'dummy-local-token';
+
+    if (githubToken && githubToken !== 'dummy-local-token') {
+      registerSecret(githubToken);
+    }
+    if (process.env.COPILOT_GITHUB_TOKEN) {
+      registerSecret(process.env.COPILOT_GITHUB_TOKEN);
+    }
 
     const octokit = github.getOctokit(githubToken);
     const context = github.context;
@@ -45,11 +45,6 @@ async function run(): Promise<void> {
     //   3. cliOptions.runId               (local CLI --run-id flag)
     //   4. context.runId                  (fallback — this is the ASSISTANT's own run ID,
     //                                      only correct when triggered directly, not via workflow_run)
-    //
-    // Priority for owner/repo:
-    //   1. Explicit `repository` action input  (e.g. "org/repo")
-    //   2. github.event.workflow_run.repository (workflow_run context)
-    //   3. cliOptions / context.repo           (local CLI / direct trigger)
     // -----------------------------------------------------------------------
     const runIdInput = parseInt(core.getInput('run-id', { required: false }) || '0', 10);
     const repoInput = core.getInput('repository', { required: false }) || '';
@@ -63,22 +58,40 @@ async function run(): Promise<void> {
                   context.runId ||
                   0;
 
+    // Safely resolve default owner and repo without throwing if GITHUB_REPOSITORY is unset
+    let defaultOwner = process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
+    let defaultRepo = 'local-repo';
+    try {
+      if (context.repo) {
+        defaultOwner = context.repo.owner || defaultOwner;
+        defaultRepo = context.repo.repo || defaultRepo;
+      }
+    } catch {
+      // Ignored outside GitHub Actions runner
+    }
+
     let owner: string;
     let repo: string;
     if (repoInput && repoInput.includes('/')) {
       [owner, repo] = repoInput.split('/');
     } else if (workflowRunEvent?.repository) {
-      owner = workflowRunEvent.repository.owner?.login || context.repo?.owner || 'local-owner';
-      repo  = workflowRunEvent.repository.name        || context.repo?.repo  || 'local-repo';
+      owner = workflowRunEvent.repository.owner?.login || defaultOwner;
+      repo  = workflowRunEvent.repository.name        || defaultRepo;
     } else {
-      owner = cliOptions.owner || context.repo?.owner || process.env.GITHUB_REPOSITORY_OWNER || 'local-owner';
-      repo  = cliOptions.repo  || context.repo?.repo  || (process.env.GITHUB_REPOSITORY ? process.env.GITHUB_REPOSITORY.split('/')[1] : 'local-repo');
+      owner = cliOptions.owner || defaultOwner;
+      repo  = cliOptions.repo  || defaultRepo;
     }
+
+    owner = owner.trim();
+    repo = repo.trim();
 
     const pullNumber = cliOptions.pullNumber ||
                        (workflowRunEvent as any)?.pull_requests?.[0]?.number ||
                        context.payload?.pull_request?.number;
-    const maxDiffLines = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
+
+    const rawMaxDiff = parseInt(core.getInput('max-diff-lines', { required: false }) || '2000', 10);
+    const maxDiffLines = isNaN(rawMaxDiff) ? 2000 : Math.max(10, Math.min(rawMaxDiff, 10000));
+
     const agentCommand = core.getInput('agent-command', { required: false }) || 'copilot';
     const agentArgsInput = core.getInput('agent-args', { required: false }) || ' --acp --stdio';
     const agentArgs = agentArgsInput.split(' ').filter(Boolean);
@@ -92,7 +105,6 @@ async function run(): Promise<void> {
 
     // -----------------------------------------------------------------------
     // Step 1: Create a single MCP server instance (reused across the entire run)
-    // Tool registry loaded from config/mcp-tools.json via src/config.ts
     // -----------------------------------------------------------------------
     const mcpServer = createReadOnlyMcpServer(octokit, {
       owner,
@@ -104,8 +116,6 @@ async function run(): Promise<void> {
 
     // -----------------------------------------------------------------------
     // Step 2: Offline / local file testing support
-    // When --log-file or --diff-file are provided we pre-populate context so
-    // the agent's prompt references real data even without a live GitHub run.
     // -----------------------------------------------------------------------
     let offlineErrorLog = '';
     let offlineDiffSnippet = '';
@@ -124,12 +134,6 @@ async function run(): Promise<void> {
 
     // -----------------------------------------------------------------------
     // Step 3: Build system prompt and user prompt
-    // System prompt → templates/system-prompt.txt (single source of truth)
-    // User prompt   → src/prompts.ts (pure builder functions, no inline strings here)
-    //
-    // Architecture note: The copilot CLI manages its own tool ecosystem (github-mcp-server)
-    // and does NOT call back to our in-process MCP bridge. We pre-fetch all GitHub data
-    // here via octokit and embed it directly in the prompt instead.
     // -----------------------------------------------------------------------
     const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
     const hasPullRequest = Boolean(pullNumber);
@@ -140,89 +144,13 @@ async function run(): Promise<void> {
       author: 'developer'
     });
 
-    let userPrompt: string;
-
-    if (isLiveCi) {
-      console.log('📡 Pre-fetching GitHub data (logs, diff, metadata)...');
-
-      // --- Fetch commit metadata ---
-      let commitSha = 'HEAD';
-      let commitMessage = '';
-      let commitAuthor = 'developer';
-      let jobName = JOB_NAME;
-      try {
-        const run = await octokit.rest.actions.getWorkflowRun({
-          owner, repo, run_id: runId
+    const userPrompt = isLiveCi
+      ? buildLiveCiUserPrompt({ owner, repo, runId, hasPullRequest, pullNumber })
+      : buildOfflineUserPrompt({
+          errorLog: offlineErrorLog,
+          diffSnippet: offlineDiffSnippet,
+          jobName: JOB_NAME
         });
-        commitSha = run.data.head_sha || 'HEAD';
-        commitMessage = run.data.head_commit?.message || '';
-        commitAuthor = run.data.head_commit?.author?.name || 'developer';
-        console.log(`  ✅ Commit: ${commitSha.substring(0, 7)} by ${commitAuthor}`);
-      } catch (e) {
-        console.warn(`  ⚠️ Could not fetch commit metadata: ${(e as Error).message}`);
-      }
-
-      // --- Fetch failed job logs ---
-      let errorLog = '';
-      try {
-        const jobsRes = await octokit.rest.actions.listJobsForWorkflowRun({
-          owner, repo, run_id: runId
-        });
-        const failedJob = jobsRes.data.jobs.find(
-          j => j.conclusion === 'failure' || j.status === 'in_progress'
-        );
-        if (failedJob) {
-          jobName = failedJob.name;
-          const logsRes = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
-            owner, repo, job_id: failedJob.id
-          });
-          errorLog = extractErrorLogWindow(sanitizeText(String(logsRes.data)), 120);
-          console.log(`  ✅ Logs: fetched error window for job "${failedJob.name}"`);
-        } else {
-          console.warn('  ⚠️ No failed job found in workflow run.');
-        }
-      } catch (e) {
-        console.warn(`  ⚠️ Could not fetch job logs: ${(e as Error).message}`);
-      }
-
-      // --- Fetch code diff ---
-      let diffSnippet = '';
-      try {
-        if (hasPullRequest && pullNumber) {
-          const diffRes = await octokit.rest.pulls.get({
-            owner, repo, pull_number: pullNumber,
-            mediaType: { format: 'diff' }
-          });
-          diffSnippet = sanitizeText(String(diffRes.data))
-            .split('\n').slice(0, maxDiffLines).join('\n');
-          console.log('  ✅ Diff: fetched PR diff');
-        } else {
-          const commitRes = await octokit.rest.repos.getCommit({
-            owner, repo, ref: commitSha,
-            mediaType: { format: 'diff' }
-          });
-          diffSnippet = sanitizeText(String(commitRes.data))
-            .split('\n').slice(0, maxDiffLines).join('\n');
-          console.log('  ✅ Diff: fetched commit diff');
-        }
-      } catch (e) {
-        console.warn(`  ⚠️ Could not fetch diff: ${(e as Error).message}`);
-      }
-
-      userPrompt = buildLiveCiUserPromptWithData({
-        owner, repo, runId,
-        commitSha, commitMessage, author: commitAuthor,
-        jobName, errorLog, diffSnippet,
-        hasPullRequest, pullNumber
-      });
-    } else {
-      userPrompt = buildOfflineUserPrompt({
-        errorLog: offlineErrorLog,
-        diffSnippet: offlineDiffSnippet,
-        jobName: JOB_NAME
-      });
-    }
-
 
     // -----------------------------------------------------------------------
     // Step 4: Handle --no-execute (dry-run mode)
@@ -253,24 +181,20 @@ async function run(): Promise<void> {
       await acpBridge.start();
 
       // Step 5a: Initialize Protocol
-      // ACP capabilities loaded from config/acp-capabilities.json — never edit here.
-      // protocolVersion: integer (this agent validates it as a number type)
       await acpBridge.sendRequest('initialize', {
         protocolVersion: 1,
         clientInfo: { name: 'pipeline-assistant', version: '1.0.0' },
         capabilities: ACP_CAPABILITIES
       });
 
-      // Step 5b: Create Session
-      // mcpServers must be empty — our MCP server is in-process and responds to
-      // mcp/callTool requests directly via the ACP bridge. The agent discovers
-      // tools via tools/list (handled in acp-client.ts handleAgentRequest).
+      // Step 5b: Create Session with registered Read-Only MCP Tools
       console.log('🔄 Creating new ACP Session (session/new)...');
       let sessionId: string | undefined;
       try {
         const sessionRes = await acpBridge.sendRequest('session/new', {
           cwd: process.cwd(),
-          mcpServers: []
+          mcpServers: [],
+          tools: mcpServer.listTools()
         });
         if (sessionRes?.sessionId) {
           sessionId = sessionRes.sessionId;
@@ -281,13 +205,10 @@ async function run(): Promise<void> {
       }
 
       // Step 5c: Send prompt to agent
-      // Primary format: prompt as a content array (ACP standard)
-      // Fallback format: messages array (OpenAI-compatible agents)
       console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
       acpBridge.clearStreamedText();
 
       let promptResponse: any = null;
-      // Only include sessionId if session/new actually succeeded
       const promptParams = (id: string | undefined, extra: Record<string, unknown>) =>
         id ? { sessionId: id, ...extra } : extra;
 
@@ -303,7 +224,6 @@ async function run(): Promise<void> {
           })
         );
       } catch {
-        // Fallback: some agents accept OpenAI-style messages array
         console.warn('[ACP Notice] session/prompt (prompt array) failed — retrying with messages format...');
         promptResponse = await acpBridge.sendRequest('session/prompt',
           promptParams(sessionId, {
@@ -341,6 +261,8 @@ async function run(): Promise<void> {
       acpBridge.stop();
     }
 
+    markdownReport = sanitizeText(markdownReport);
+
     // -----------------------------------------------------------------------
     // Step 6: Print and save the report
     // -----------------------------------------------------------------------
@@ -362,12 +284,15 @@ async function run(): Promise<void> {
     console.log('\n--- [GENERATED MARKDOWN REPORT] ---');
     console.log(markdownReport);
 
-    fs.writeFileSync(reportFile, markdownReport, 'utf8');
-    console.log(`\n📄 Report saved → ${reportFile}`);
+    try {
+      fs.writeFileSync(reportFile, markdownReport, 'utf8');
+      console.log(`\n📄 Report saved → ${reportFile}`);
+    } catch {
+      // Non-fatal if filesystem is read-only
+    }
 
     // -----------------------------------------------------------------------
-    // Step 7: Write GitHub Actions Job Summary (always — visible on the
-    //         failed-job Summary tab regardless of push vs PR strategy)
+    // Step 7: Write GitHub Actions Job Summary
     // -----------------------------------------------------------------------
     const triggerLabel = pullNumber ? `PR #${pullNumber}` : (context.eventName || 'push');
     try {
@@ -379,16 +304,18 @@ async function run(): Promise<void> {
         markdownReport
       });
     } catch (summaryErr: unknown) {
-      // Non-fatal: summary writing can fail outside GitHub Actions (e.g. local runs)
       console.warn(`[summary] Could not write Job Summary: ${(summaryErr as Error).message}`);
     }
 
     // -----------------------------------------------------------------------
     // Step 8: Emit inline PR annotations (only when a PR context exists)
-    //         Teams that push directly to main/master naturally skip this.
     // -----------------------------------------------------------------------
     if (pullNumber) {
-      emitPrAnnotations(markdownReport);
+      try {
+        emitPrAnnotations(markdownReport);
+      } catch (annoErr: unknown) {
+        console.warn(`[annotations] Could not emit annotations: ${(annoErr as Error).message}`);
+      }
     }
 
     // -----------------------------------------------------------------------
@@ -396,32 +323,37 @@ async function run(): Promise<void> {
     // -----------------------------------------------------------------------
     if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
       console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
-      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP) & Read-Only MCP.*`;
+      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP).*`;
 
-      const comments = await octokit.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number: pullNumber
-      });
-
-      const existingComment = comments.data.find(c => c.body?.includes(BOT_COMMENT_SIGNATURE));
-
-      if (existingComment) {
-        await octokit.rest.issues.updateComment({
+      try {
+        const comments = await octokit.rest.issues.listComments({
           owner,
           repo,
-          comment_id: existingComment.id,
-          body: fullCommentBody
+          issue_number: pullNumber
         });
-        console.log(`🔄 Updated existing comment #${existingComment.id}`);
-      } else {
-        await octokit.rest.issues.createComment({
-          owner,
-          repo,
-          issue_number: pullNumber,
-          body: fullCommentBody
-        });
-        console.log('✨ Created new PR comment with failure diagnosis.');
+
+        const existingComment = comments.data.find(c => c.body?.includes(BOT_COMMENT_SIGNATURE));
+
+        if (existingComment) {
+          await octokit.rest.issues.updateComment({
+            owner,
+            repo,
+            comment_id: existingComment.id,
+            body: fullCommentBody
+          });
+          console.log(`🔄 Updated existing comment #${existingComment.id}`);
+        } else {
+          await octokit.rest.issues.createComment({
+            owner,
+            repo,
+            issue_number: pullNumber,
+            body: fullCommentBody
+          });
+          console.log('✨ Created new PR comment with failure diagnosis.');
+        }
+      } catch (commentErr: unknown) {
+        // Non-fatal: token might lack pull-requests: write permissions in fork PRs
+        console.warn(`⚠️  Could not post/update PR comment: ${(commentErr as Error).message}`);
       }
     }
 
@@ -436,3 +368,4 @@ async function run(): Promise<void> {
 }
 
 run();
+

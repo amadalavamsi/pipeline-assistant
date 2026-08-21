@@ -1,16 +1,24 @@
 /**
  * Structured Logger for ACP (Agent Client Protocol) and MCP (Model Context Protocol)
  * Provides detailed timestamps, message direction markers, and security gate audit traces.
- * All output is tee'd to acp-debug.log in the working directory for post-run inspection.
+ * All output is sanitized and tee'd to acp-debug.log for post-run inspection.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { sanitizeText } from './sanitizer';
 
-const LOG_FILE = path.join(process.cwd(), 'acp-debug.log');
+// Store log file in RUNNER_TEMP if in GitHub Actions, or fallback to current directory
+const LOG_DIR = process.env.RUNNER_TEMP || process.cwd();
+const LOG_FILE = path.join(LOG_DIR, 'acp-debug.log');
 
-// Truncate the log file at process start so each run gets a clean file
-fs.writeFileSync(LOG_FILE, `=== Pipeline Assistant Debug Log ===\nStarted: ${new Date().toISOString()}\n\n`, 'utf8');
+try {
+  // Truncate the log file at process start so each run gets a clean file
+  fs.writeFileSync(LOG_FILE, `=== Pipeline Assistant Debug Log ===\nStarted: ${new Date().toISOString()}\n\n`, 'utf8');
+} catch {
+  // Non-fatal fallback if filesystem is read-only
+}
 
 function writeToFile(line: string): void {
   try {
@@ -21,18 +29,21 @@ function writeToFile(line: string): void {
 }
 
 function log(msg: string): void {
-  console.log(msg);
-  writeToFile(msg);
+  const sanitized = sanitizeText(msg);
+  console.log(sanitized);
+  writeToFile(sanitized);
 }
 
 function warn(msg: string): void {
-  console.warn(msg);
-  writeToFile(msg);
+  const sanitized = sanitizeText(msg);
+  console.warn(sanitized);
+  writeToFile(sanitized);
 }
 
 function error(msg: string): void {
-  console.error(msg);
-  writeToFile(msg);
+  const sanitized = sanitizeText(msg);
+  console.error(sanitized);
+  writeToFile(sanitized);
 }
 
 export class ProtocolLogger {
@@ -97,3 +108,4 @@ export class ProtocolLogger {
     error(`  └─ Error: ${errorMsg}`);
   }
 }
+

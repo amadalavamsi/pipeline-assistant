@@ -193,6 +193,168 @@ export function createReadOnlyMcpServer(
           }
         }
 
+        case 'get_recent_commits': {
+          try {
+            const count = Math.min(20, Math.max(1, (args.count as number) || 5));
+            let branch = 'HEAD';
+
+            try {
+              const run = await octokit.rest.actions.getWorkflowRun({
+                owner: context.owner,
+                repo: context.repo,
+                run_id: context.runId
+              });
+              branch = run.data.head_branch || run.data.head_sha || 'HEAD';
+            } catch {
+              // Fallback to default branch
+            }
+
+            const commitsResponse = await octokit.rest.repos.listCommits({
+              owner: context.owner,
+              repo: context.repo,
+              sha: branch,
+              per_page: count
+            });
+
+            const commits = commitsResponse.data.map(c => ({
+              sha: c.sha.substring(0, 7),
+              fullSha: c.sha,
+              author: c.commit.author?.name || c.author?.login || 'unknown',
+              message: sanitizeText(c.commit.message),
+              date: c.commit.author?.date
+            }));
+
+            const result = JSON.stringify({
+              branch,
+              count: commits.length,
+              commits
+            });
+
+            ProtocolLogger.mcpToolResult(name, `Retrieved last ${commits.length} commits on ${branch}`, result.length);
+            return result;
+          } catch (err: unknown) {
+            const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
+            return JSON.stringify({ error: `Failed to fetch recent commits: ${error.message}` });
+          }
+        }
+
+        case 'get_commit_diff': {
+          try {
+            const commitSha = args.commitSha as string;
+            if (!commitSha) {
+              return JSON.stringify({ error: 'Missing required parameter: commitSha' });
+            }
+
+            const maxLines = (args.maxLines as number) || context.maxDiffLines;
+            const commitResponse = await octokit.rest.repos.getCommit({
+              owner: context.owner,
+              repo: context.repo,
+              ref: commitSha,
+              mediaType: { format: 'diff' }
+            });
+
+            const rawDiff = String(commitResponse.data);
+            const sanitized = sanitizeText(rawDiff);
+            const diffLines = sanitized.split('\n');
+            const limitedDiff = diffLines.slice(0, maxLines).join('\n');
+
+            const result = JSON.stringify({
+              commitSha,
+              totalLines: diffLines.length,
+              diffSnippet: limitedDiff
+            });
+
+            ProtocolLogger.mcpToolResult(name, `Fetched diff for commit ${commitSha} (${diffLines.length} lines, capped to ${maxLines})`, result.length);
+            return result;
+          } catch (err: unknown) {
+            const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
+            return JSON.stringify({ error: `Failed to fetch diff for commit ${args.commitSha}: ${error.message}` });
+          }
+        }
+
+        case 'get_file_content': {
+          try {
+            const rawFilePath = args.filePath as string;
+            if (!rawFilePath || typeof rawFilePath !== 'string') {
+              return JSON.stringify({ error: 'Missing required parameter: filePath' });
+            }
+
+            // Path normalization and traversal prevention
+            const normalizedPath = rawFilePath.replace(/\\/g, '/').replace(/^\/+/, '');
+            if (normalizedPath.includes('..') || normalizedPath.startsWith('./')) {
+              const err = `Access denied: Path traversal patterns are strictly forbidden: "${rawFilePath}"`;
+              ProtocolLogger.mcpToolError(name, err);
+              return JSON.stringify({ error: err });
+            }
+
+            // Sensitive file blacklist — enterprise security safeguard
+            const sensitiveFilePatterns = [
+              /^\.env(\..+)?$/i,
+              /^\.git\//i,
+              /^\.aws\//i,
+              /^\.ssh\//i,
+              /id_rsa/i,
+              /id_ed25519/i,
+              /id_dsa/i,
+              /\.(pem|key|p12|pfx|pkcs12|keystore|jks)$/i,
+              /credentials(\.json|\.ya?ml|\.ini)?$/i,
+              /secrets?(\.json|\.ya?ml)?$/i
+            ];
+
+            if (sensitiveFilePatterns.some(pattern => pattern.test(normalizedPath))) {
+              const err = `Security Gate: Access to sensitive or credential file "${normalizedPath}" is blocked.`;
+              ProtocolLogger.mcpToolError(name, err);
+              return JSON.stringify({ error: err });
+            }
+
+            let ref = args.ref as string | undefined;
+            if (!ref) {
+              try {
+                const run = await octokit.rest.actions.getWorkflowRun({
+                  owner: context.owner,
+                  repo: context.repo,
+                  run_id: context.runId
+                });
+                ref = run.data.head_sha;
+              } catch {
+                ref = 'HEAD';
+              }
+            }
+
+            const fileResponse = await octokit.rest.repos.getContent({
+              owner: context.owner,
+              repo: context.repo,
+              path: normalizedPath,
+              ref
+            });
+
+            if ('content' in fileResponse.data && fileResponse.data.encoding === 'base64') {
+              const decoded = Buffer.from(fileResponse.data.content, 'base64').toString('utf8');
+              const sanitized = sanitizeText(decoded);
+              const lines = sanitized.split('\n');
+              const limitedContent = lines.slice(0, 500).join('\n'); // cap to 500 lines
+
+              const result = JSON.stringify({
+                filePath: normalizedPath,
+                ref,
+                totalLines: lines.length,
+                content: limitedContent
+              });
+
+              ProtocolLogger.mcpToolResult(name, `Fetched file ${normalizedPath} @ ${ref} (${lines.length} lines)`, result.length);
+              return result;
+            } else {
+              return JSON.stringify({ error: `Path "${normalizedPath}" is not a readable file.` });
+            }
+          } catch (err: unknown) {
+            const error = err as Error;
+            ProtocolLogger.mcpToolError(name, error.message);
+            return JSON.stringify({ error: `Failed to fetch file content: ${error.message}` });
+          }
+        }
+
         default: {
           const err = `Tool "${name}" is not supported in read-only mode.`;
           ProtocolLogger.mcpToolError(name, err);

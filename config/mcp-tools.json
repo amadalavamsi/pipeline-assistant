@@ -45,5 +45,54 @@
         }
       }
     }
+  },
+  {
+    "name": "get_recent_commits",
+    "description": "Retrieve the list of recent commits on the repository branch (up to specified count) to diagnose multi-commit regression issues.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "number",
+          "description": "Number of recent commits to fetch (default: 5, max: 20)"
+        }
+      }
+    }
+  },
+  {
+    "name": "get_commit_diff",
+    "description": "Fetch the sanitized git diff of a specific commit SHA to inspect code changes from earlier commits in the branch.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "commitSha": {
+          "type": "string",
+          "description": "The full or short SHA of the commit to inspect"
+        },
+        "maxLines": {
+          "type": "number",
+          "description": "Max diff lines to retrieve (default: 2000)"
+        }
+      },
+      "required": ["commitSha"]
+    }
+  },
+  {
+    "name": "get_file_content",
+    "description": "Fetch the content of a specific source code file from the repository at a given git ref/commit for deeper diagnosis.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "filePath": {
+          "type": "string",
+          "description": "The repository-relative path to the file (e.g. src/UserService.java)"
+        },
+        "ref": {
+          "type": "string",
+          "description": "Optional branch name or commit SHA (defaults to the failing run's head commit)"
+        }
+      },
+      "required": ["filePath"]
+    }
   }
 ]

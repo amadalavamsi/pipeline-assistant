@@ -6,8 +6,10 @@
  */
 
 import { spawn, ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { ReadOnlyMcpServer } from './mcp-tools';
 import { ProtocolLogger } from './logger';
+import { sanitizeText } from './sanitizer';
 
 export interface AcpSessionConfig {
   workspacePath: string;
@@ -28,9 +30,10 @@ export interface JsonRpcMessage {
 export class AcpClientBridge {
   private process: ChildProcess | null = null;
   private messageIdCounter = 1;
-  private pendingRequests = new Map<number | string, { resolve: (val: any) => void; reject: (err: any) => void }>();
+  private pendingRequests = new Map<number | string, { resolve: (val: any) => void; reject: (err: any) => void; timer: NodeJS.Timeout }>();
   private mcpServer: ReadOnlyMcpServer;
   private activeSessionTextBuffer: string = '';
+  private decoder = new StringDecoder('utf8');
 
   constructor(private config: AcpSessionConfig) {
     this.mcpServer = config.mcpServer;
@@ -53,7 +56,7 @@ export class AcpClientBridge {
 
     let buffer = '';
     this.process.stdout.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
+      buffer += this.decoder.write(chunk);
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -82,6 +85,7 @@ export class AcpClientBridge {
 
   private _rejectAllPending(reason: string): void {
     for (const [id, handler] of this.pendingRequests) {
+      clearTimeout(handler.timer);
       this.pendingRequests.delete(id);
       handler.reject(new Error(reason));
     }
@@ -96,6 +100,7 @@ export class AcpClientBridge {
         ProtocolLogger.acpInboundResponse(msg.id, msg.result, msg.error);
         const handler = this.pendingRequests.get(msg.id);
         if (handler) {
+          clearTimeout(handler.timer);
           this.pendingRequests.delete(msg.id);
           if (msg.error) {
             handler.reject(new Error(msg.error.message));
@@ -115,20 +120,25 @@ export class AcpClientBridge {
           const params = msg.params as any;
           const update = params?.update;
 
+          let chunkText = '';
           // Copilot ACP: agent_message_chunk delivers text at update.content.text
           if (update?.sessionUpdate === 'agent_message_chunk' && update?.content?.text) {
-            this.activeSessionTextBuffer += update.content.text;
+            chunkText = update.content.text;
           // Legacy / alternative agents: text at params.update.agent_message_chunk.text
           } else if (update?.agent_message_chunk?.text) {
-            this.activeSessionTextBuffer += update.agent_message_chunk.text;
+            chunkText = update.agent_message_chunk.text;
           // Flat text on params
           } else if (params?.text) {
-            this.activeSessionTextBuffer += params.text;
+            chunkText = params.text;
           // Flat content on params
           } else if (params?.content) {
-            this.activeSessionTextBuffer += typeof params.content === 'string'
+            chunkText = typeof params.content === 'string'
               ? params.content
               : JSON.stringify(params.content);
+          }
+
+          if (chunkText) {
+            this.activeSessionTextBuffer += chunkText;
           }
           return;
         }
@@ -141,7 +151,7 @@ export class AcpClientBridge {
   }
 
   public getStreamedText(): string {
-    return this.activeSessionTextBuffer;
+    return sanitizeText(this.activeSessionTextBuffer);
   }
 
   public clearStreamedText(): void {
@@ -193,7 +203,12 @@ export class AcpClientBridge {
     }
 
     // Tools discovery — agent calls this to learn what MCP tools are available
-    if (method === 'tools/list') {
+    if (
+      method === 'tools/list' ||
+      method === 'mcp/listTools' ||
+      method === 'session/list_tools' ||
+      method === 'mcp/list_tools'
+    ) {
       if (reqId !== undefined) {
         this.sendResponse({
           jsonrpc: '2.0',
@@ -205,7 +220,13 @@ export class AcpClientBridge {
     }
 
     // MCP Read-Only Tool Execution Dispatcher
-    if (method === 'mcp/callTool' || method === 'tools/call') {
+    if (
+      method === 'mcp/callTool' ||
+      method === 'tools/call' ||
+      method === 'session/call_tool' ||
+      method === 'mcp/call_tool' ||
+      method === 'agent/callTool'
+    ) {
       const toolName = (req.params as any)?.name || (req.params as any)?.toolName;
       const toolArgs = (req.params as any)?.arguments || (req.params as any)?.args || {};
 
@@ -215,7 +236,7 @@ export class AcpClientBridge {
           this.sendResponse({
             jsonrpc: '2.0',
             id: reqId,
-            result: { content: [{ type: 'text', text: resultString }] }
+            result: { content: [{ type: 'text', text: sanitizeText(resultString) }] }
           });
         }
       } catch (err: unknown) {
@@ -244,16 +265,15 @@ export class AcpClientBridge {
     ProtocolLogger.acpOutbound(method, id, params);
 
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
-      this.sendMessage(message);
-
-      // Safety timeout: 60 seconds
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
           reject(new Error(`ACP Request "${method}" timed out after 60s.`));
         }
       }, 60000);
+
+      this.pendingRequests.set(id, { resolve, reject, timer });
+      this.sendMessage(message);
     });
   }
 
@@ -269,7 +289,22 @@ export class AcpClientBridge {
 
   public stop(): void {
     if (this.process) {
-      this.process.kill('SIGTERM');
+      try {
+        this.process.kill('SIGTERM');
+        // Fallback kill after 2s if process hasn't terminated
+        const proc = this.process;
+        setTimeout(() => {
+          try {
+            if (proc && !proc.killed) {
+              proc.kill('SIGKILL');
+            }
+          } catch {
+            // Process already exited
+          }
+        }, 2000);
+      } catch {
+        // Ignored
+      }
       this.process = null;
     }
   }
