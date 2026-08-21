@@ -10,7 +10,7 @@ import { sanitizeText, extractErrorLogWindow, initializeEnvSecretMasking, regist
 import { ProtocolLogger } from './logger';
 import { writeJobSummary, emitPrAnnotations } from './reporter';
 import { ACP_CAPABILITIES, BOT_COMMENT_SIGNATURE, JOB_NAME, FALLBACK } from './config';
-import { buildLiveCiUserPrompt, buildOfflineUserPrompt } from './prompts';
+import { buildLiveCiUserPromptWithData, buildOfflineUserPrompt } from './prompts';
 
 async function run(): Promise<void> {
   try {
@@ -133,7 +133,7 @@ async function run(): Promise<void> {
     }
 
     // -----------------------------------------------------------------------
-    // Step 3: Build system prompt and user prompt
+    // Step 3: Build system prompt and user prompt (Pre-fetched & Sanitized)
     // -----------------------------------------------------------------------
     const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
     const hasPullRequest = Boolean(pullNumber);
@@ -144,13 +144,88 @@ async function run(): Promise<void> {
       author: 'developer'
     });
 
-    const userPrompt = isLiveCi
-      ? buildLiveCiUserPrompt({ owner, repo, runId, hasPullRequest, pullNumber })
-      : buildOfflineUserPrompt({
-          errorLog: offlineErrorLog,
-          diffSnippet: offlineDiffSnippet,
-          jobName: JOB_NAME
+    let userPrompt: string;
+
+    if (isLiveCi) {
+      console.log('📡 Fetching failure evidence (logs, diff, commit metadata)...');
+
+      // --- Fetch commit metadata ---
+      let commitSha = 'HEAD';
+      let commitMessage = '';
+      let commitAuthor = 'developer';
+      let jobName = JOB_NAME;
+      try {
+        const run = await octokit.rest.actions.getWorkflowRun({
+          owner, repo, run_id: runId
         });
+        commitSha = run.data.head_sha || 'HEAD';
+        commitMessage = run.data.head_commit?.message || '';
+        commitAuthor = run.data.head_commit?.author?.name || 'developer';
+        console.log(`  ✅ Commit: ${commitSha.substring(0, 7)} by ${commitAuthor}`);
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch commit metadata: ${(e as Error).message}`);
+      }
+
+      // --- Fetch failed job logs only ---
+      let errorLog = '';
+      try {
+        const jobsRes = await octokit.rest.actions.listJobsForWorkflowRun({
+          owner, repo, run_id: runId
+        });
+        const failedJob = jobsRes.data.jobs.find(
+          j => j.conclusion === 'failure' || j.status === 'in_progress'
+        );
+        if (failedJob) {
+          jobName = failedJob.name;
+          const logsRes = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
+            owner, repo, job_id: failedJob.id
+          });
+          errorLog = extractErrorLogWindow(sanitizeText(String(logsRes.data)), 120);
+          console.log(`  ✅ Logs: extracted error window for job "${failedJob.name}"`);
+        } else {
+          console.warn('  ⚠️ No failed job found in workflow run.');
+        }
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch job logs: ${(e as Error).message}`);
+      }
+
+      // --- Fetch code diff only ---
+      let diffSnippet = '';
+      try {
+        if (hasPullRequest && pullNumber) {
+          const diffRes = await octokit.rest.pulls.get({
+            owner, repo, pull_number: pullNumber,
+            mediaType: { format: 'diff' }
+          });
+          diffSnippet = sanitizeText(String(diffRes.data))
+            .split('\n').slice(0, maxDiffLines).join('\n');
+          console.log('  ✅ Diff: fetched PR diff');
+        } else {
+          const commitRes = await octokit.rest.repos.getCommit({
+            owner, repo, ref: commitSha,
+            mediaType: { format: 'diff' }
+          });
+          diffSnippet = sanitizeText(String(commitRes.data))
+            .split('\n').slice(0, maxDiffLines).join('\n');
+          console.log('  ✅ Diff: fetched commit diff');
+        }
+      } catch (e) {
+        console.warn(`  ⚠️ Could not fetch diff: ${(e as Error).message}`);
+      }
+
+      userPrompt = buildLiveCiUserPromptWithData({
+        owner, repo, runId,
+        commitSha, commitMessage, author: commitAuthor,
+        jobName, errorLog, diffSnippet,
+        hasPullRequest, pullNumber
+      });
+    } else {
+      userPrompt = buildOfflineUserPrompt({
+        errorLog: offlineErrorLog,
+        diffSnippet: offlineDiffSnippet,
+        jobName: JOB_NAME
+      });
+    }
 
     // -----------------------------------------------------------------------
     // Step 4: Handle --no-execute (dry-run mode)
@@ -187,14 +262,13 @@ async function run(): Promise<void> {
         capabilities: ACP_CAPABILITIES
       });
 
-      // Step 5b: Create Session with registered Read-Only MCP Tools
+      // Step 5b: Create Session
       console.log('🔄 Creating new ACP Session (session/new)...');
       let sessionId: string | undefined;
       try {
         const sessionRes = await acpBridge.sendRequest('session/new', {
           cwd: process.cwd(),
-          mcpServers: [],
-          tools: mcpServer.listTools()
+          mcpServers: []
         });
         if (sessionRes?.sessionId) {
           sessionId = sessionRes.sessionId;
@@ -208,32 +282,19 @@ async function run(): Promise<void> {
       console.log('🧠 Prompting ACP Agent for Root Cause & Evidence Analysis...');
       acpBridge.clearStreamedText();
 
-      let promptResponse: any = null;
-      const promptParams = (id: string | undefined, extra: Record<string, unknown>) =>
-        id ? { sessionId: id, ...extra } : extra;
-
-      try {
-        promptResponse = await acpBridge.sendRequest('session/prompt',
-          promptParams(sessionId, {
-            prompt: [
-              {
-                type: 'text',
-                text: `${systemPrompt}\n\n${userPrompt}`
-              }
-            ]
-          })
-        );
-      } catch {
-        console.warn('[ACP Notice] session/prompt (prompt array) failed — retrying with messages format...');
-        promptResponse = await acpBridge.sendRequest('session/prompt',
-          promptParams(sessionId, {
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt }
-            ]
-          })
-        );
+      const promptPayload: Record<string, unknown> = {
+        prompt: [
+          {
+            type: 'text',
+            text: `${systemPrompt}\n\n${userPrompt}`
+          }
+        ]
+      };
+      if (sessionId) {
+        promptPayload.sessionId = sessionId;
       }
+
+      const promptResponse = await acpBridge.sendRequest('session/prompt', promptPayload);
 
       const streamedText = acpBridge.getStreamedText();
       markdownReport =
