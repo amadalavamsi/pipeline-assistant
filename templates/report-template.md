@@ -1,14 +1,32 @@
-## ❌ Pipeline Failure Analysis
-- **Failed Job**: `{{jobName}}`
-- **Commit**: `{{commitSha}}` by `{{author}}`
+## Failure Summary
 
-### 📜 Error Log
+❌ {{jobName}}
+
+## Diagnosis
+
+- **Status**: UNKNOWN
+- **Confidence**: 40%
+
+## Root Cause
+
+{{rootCause}}
+
+## What Changed
+
+Commit `{{commitSha}}` by `{{author}}`
+
+## Evidence
+
 ```text
 {{logEvidence}}
 ```
 
-### 🔍 Root Cause
-{{rootCause}}
+## Suggested Fix / Next Steps
 
-### 💡 Suggested Fix
 {{suggestedFix}}
+
+## Files Involved
+
+- `{{jobName}}`
+
+

@@ -34,20 +34,36 @@ export function formatReportTemplate(variables: {
   if (fs.existsSync(templatePath)) {
     content = fs.readFileSync(templatePath, 'utf8');
   } else {
-    content = `### ❌ Pipeline Failure Analysis
-- **Failed Job**: \`{{jobName}}\`
-- **Commit**: \`{{commitSha}}\` by \`{{author}}\`
+    content = `## Failure Summary
 
-#### 🔍 Root Cause
+❌ {{jobName}}
+
+## Diagnosis
+
+- **Status**: UNKNOWN
+- **Confidence**: 40%
+
+## Root Cause
+
 {{rootCause}}
 
-#### 📜 Log Evidence
+## What Changed
+
+Commit \`{{commitSha}}\` by \`{{author}}\`
+
+## Evidence
+
 \`\`\`text
 {{logEvidence}}
 \`\`\`
 
-#### 💡 Suggested Fix
-{{suggestedFix}}`;
+## Suggested Fix / Next Steps
+
+{{suggestedFix}}
+
+## Files Involved
+
+- \`{{jobName}}\``;
   }
 
   for (const [key, value] of Object.entries(variables)) {
