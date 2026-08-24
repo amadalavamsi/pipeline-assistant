@@ -14,8 +14,7 @@ export function getSystemPrompt(variables: Record<string, string> = {}): string 
   let content = fs.readFileSync(templatePath, 'utf8');
 
   for (const [key, value] of Object.entries(variables)) {
-    const token = `{{${key}}}`;
-    content = content.split(token).join(value);
+    content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
   }
 
   return content;
@@ -42,8 +41,7 @@ export function formatReportTemplate(variables: {
 ## Diagnosis
 
 - **Status**: UNKNOWN
-- **Confidence**: N/A
-- **Commit Causality**: UNKNOWN
+- **Confidence**: 40%
 
 ## Root Cause
 
@@ -69,8 +67,7 @@ Commit \`{{commitSha}}\` by \`{{author}}\`
   }
 
   for (const [key, value] of Object.entries(variables)) {
-    const token = `{{${key}}}`;
-    content = content.split(token).join(value);
+    content = content.replace(new RegExp(`{{${key}}}`, 'g'), value);
   }
 
   return content;

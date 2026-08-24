@@ -1,8 +1,9 @@
 /**
- * ACP (Agent Client Protocol) Bridge Engine
- * Handles JSON-RPC 2.0 connection to the ACP Agent runner (GitHub Copilot ACP server).
- * Strictly enforces Read-Only execution, zero bash terminal execution, and zero file modification.
- * Features full streaming aggregation for session/update notifications and session/prompt.
+ * ACP (Agent Client Protocol) Bridge Engine.
+ *
+ * The bridge is deliberately read-only for CI failure analysis. It also keeps
+ * the agent process on a least-privilege environment instead of inheriting all
+ * CI secrets from the parent process.
  */
 
 import { spawn, ChildProcess } from 'child_process';
@@ -30,24 +31,55 @@ export interface JsonRpcMessage {
 export class AcpClientBridge {
   private process: ChildProcess | null = null;
   private messageIdCounter = 1;
-  private pendingRequests = new Map<number | string, { resolve: (val: any) => void; reject: (err: any) => void; timer: NodeJS.Timeout }>();
+  private pendingRequests = new Map<number | string, {
+    resolve: (val: any) => void;
+    reject: (err: any) => void;
+    timer: NodeJS.Timeout;
+  }>();
   private mcpServer: ReadOnlyMcpServer;
-  private activeSessionTextBuffer: string = '';
+  private activeSessionTextBuffer = '';
   private decoder = new StringDecoder('utf8');
+  private stopping = false;
 
   constructor(private config: AcpSessionConfig) {
     this.mcpServer = config.mcpServer;
   }
 
   public async start(): Promise<void> {
+    if (this.process) throw new Error('ACP agent process is already running.');
+
     const cmd = this.config.agentCommand;
     const args = this.config.agentArgs || [];
+    console.log(`[ACP Process] Launching: ${sanitizeText(cmd)} ${sanitizeText(args.join(' '))}`);
 
-    console.log(`[ACP Process] Launching: ${cmd} ${args.join(' ')}`);
+    // Do not blindly pass every CI secret to the agent process. Copilot may
+    // need GitHub auth, but unrelated cloud/database/package credentials are
+    // not required for read-only analysis.
+    const parentEnv = process.env;
+    const env: NodeJS.ProcessEnv = {
+      PATH: parentEnv.PATH,
+      HOME: parentEnv.HOME,
+      TMPDIR: parentEnv.TMPDIR,
+      TEMP: parentEnv.TEMP,
+      TMP: parentEnv.TMP,
+      LANG: parentEnv.LANG,
+      LC_ALL: parentEnv.LC_ALL,
+      CI: 'true',
+      READ_ONLY_MODE: 'true'
+    };
 
+    for (const key of [
+      'GITHUB_TOKEN', 'GH_TOKEN', 'COPILOT_GITHUB_TOKEN',
+      'GITHUB_API_URL', 'GITHUB_SERVER_URL', 'GITHUB_REPOSITORY'
+    ]) {
+      if (parentEnv[key]) env[key] = parentEnv[key];
+    }
+
+    this.stopping = false;
     this.process = spawn(cmd, args, {
+      cwd: this.config.workspacePath,
       stdio: ['pipe', 'pipe', 'inherit'],
-      env: { ...process.env, CI: 'true', READ_ONLY_MODE: 'true' }
+      env
     });
 
     if (!this.process.stdout || !this.process.stdin) {
@@ -57,14 +89,11 @@ export class AcpClientBridge {
     let buffer = '';
     this.process.stdout.on('data', (chunk: Buffer) => {
       buffer += this.decoder.write(chunk);
-      const lines = buffer.split('\n');
+      const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() || '';
-
       for (const line of lines) {
         const trimmed = line.trim();
-        if (trimmed) {
-          this.handleIncomingMessage(trimmed);
-        }
+        if (trimmed) this.handleIncomingMessage(trimmed);
       }
     });
 
@@ -74,12 +103,14 @@ export class AcpClientBridge {
     });
 
     this.process.on('close', (code, signal) => {
-      if (this.pendingRequests.size > 0) {
+      if (buffer.trim()) this.handleIncomingMessage(buffer.trim());
+      if (!this.stopping && this.pendingRequests.size > 0) {
         const reason = `ACP agent process exited unexpectedly (code=${code}, signal=${signal}). ` +
-          `Ensure the agent command is installed and accessible on PATH in the runner.`;
+          'Ensure the agent command is installed and accessible on PATH in the runner.';
         console.error(`[ACP Process Error] ${reason}`);
         this._rejectAllPending(reason);
       }
+      this.process = null;
     });
   }
 
@@ -92,61 +123,56 @@ export class AcpClientBridge {
   }
 
   private handleIncomingMessage(rawJson: string): void {
+    let parsed: unknown;
     try {
-      const msg: JsonRpcMessage = JSON.parse(rawJson);
+      parsed = JSON.parse(rawJson);
+    } catch {
+      ProtocolLogger.acpProtocolWarning(`Ignoring non-JSON stdout line (${rawJson.length} chars).`);
+      return;
+    }
 
-      // Response to a request we sent
-      if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
-        ProtocolLogger.acpInboundResponse(msg.id, msg.result, msg.error);
-        const handler = this.pendingRequests.get(msg.id);
-        if (handler) {
-          clearTimeout(handler.timer);
-          this.pendingRequests.delete(msg.id);
-          if (msg.error) {
-            handler.reject(new Error(msg.error.message));
-          } else {
-            handler.resolve(msg.result);
-          }
+    if (!parsed || typeof parsed !== 'object' || (parsed as any).jsonrpc !== '2.0') {
+      ProtocolLogger.acpProtocolWarning('Ignoring malformed JSON-RPC message without jsonrpc=2.0.');
+      return;
+    }
+
+    const msg = parsed as JsonRpcMessage;
+
+    if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      ProtocolLogger.acpInboundResponse(msg.id, msg.result, msg.error);
+      const handler = this.pendingRequests.get(msg.id);
+      if (handler) {
+        clearTimeout(handler.timer);
+        this.pendingRequests.delete(msg.id);
+        if (msg.error) handler.reject(new Error(msg.error.message));
+        else handler.resolve(msg.result);
+      }
+      return;
+    }
+
+    if (msg.method) {
+      ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
+
+      if (msg.method === 'session/update' || msg.method === 'notifications/message') {
+        const params = msg.params as any;
+        const update = params?.update;
+        let chunkText = '';
+
+        if (update?.sessionUpdate === 'agent_message_chunk' && update?.content?.text) {
+          chunkText = update.content.text;
+        } else if (update?.agent_message_chunk?.text) {
+          chunkText = update.agent_message_chunk.text;
+        } else if (params?.text) {
+          chunkText = params.text;
+        } else if (params?.content) {
+          chunkText = typeof params.content === 'string' ? params.content : JSON.stringify(params.content);
         }
+
+        if (chunkText) this.activeSessionTextBuffer += chunkText;
         return;
       }
 
-      // Notification or Request from Agent to Client
-      if (msg.method) {
-        ProtocolLogger.acpInboundRequest(msg.method, msg.id, msg.params);
-
-        // Handle streaming response updates from the agent
-        if (msg.method === 'session/update' || msg.method === 'notifications/message') {
-          const params = msg.params as any;
-          const update = params?.update;
-
-          let chunkText = '';
-          // Copilot ACP: agent_message_chunk delivers text at update.content.text
-          if (update?.sessionUpdate === 'agent_message_chunk' && update?.content?.text) {
-            chunkText = update.content.text;
-          // Legacy / alternative agents: text at params.update.agent_message_chunk.text
-          } else if (update?.agent_message_chunk?.text) {
-            chunkText = update.agent_message_chunk.text;
-          // Flat text on params
-          } else if (params?.text) {
-            chunkText = params.text;
-          // Flat content on params
-          } else if (params?.content) {
-            chunkText = typeof params.content === 'string'
-              ? params.content
-              : JSON.stringify(params.content);
-          }
-
-          if (chunkText) {
-            this.activeSessionTextBuffer += chunkText;
-          }
-          return;
-        }
-
-        this.handleAgentRequest(msg);
-      }
-    } catch {
-      // Ignore unparseable non-JSON-RPC lines
+      void this.handleAgentRequest(msg);
     }
   }
 
@@ -159,10 +185,9 @@ export class AcpClientBridge {
   }
 
   private async handleAgentRequest(req: JsonRpcMessage): Promise<void> {
-    const method = req.method;
+    const method = req.method || '';
     const reqId = req.id;
 
-    // Security Gate 1: Deny any bash / shell command execution requests
     if (
       method === 'client/requestPermission' ||
       method === 'client/runCommand' ||
@@ -170,19 +195,13 @@ export class AcpClientBridge {
       method === 'session/request_permission'
     ) {
       const reason = 'Terminal execution is strictly disabled in CI/CD analysis mode.';
-      ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
-
+      ProtocolLogger.acpSecurityBlocked(method, reason);
       if (reqId !== undefined) {
-        this.sendResponse({
-          jsonrpc: '2.0',
-          id: reqId,
-          result: { granted: false, reason }
-        });
+        this.sendResponse({ jsonrpc: '2.0', id: reqId, error: { code: -32001, message: reason } });
       }
       return;
     }
 
-    // Security Gate 2: Deny any file write / code modifications
     if (
       method === 'client/applyEdit' ||
       method === 'workspace/applyEdit' ||
@@ -190,78 +209,53 @@ export class AcpClientBridge {
       method === 'session/apply_edit'
     ) {
       const reason = 'File modification is disabled in Read-Only analysis mode.';
-      ProtocolLogger.acpSecurityBlocked(method || 'unknown', reason);
-
+      ProtocolLogger.acpSecurityBlocked(method, reason);
       if (reqId !== undefined) {
-        this.sendResponse({
-          jsonrpc: '2.0',
-          id: reqId,
-          result: { success: false, reason }
-        });
+        this.sendResponse({ jsonrpc: '2.0', id: reqId, error: { code: -32002, message: reason } });
       }
       return;
     }
 
-    // Tools discovery — agent calls this to learn what MCP tools are available
-    if (
-      method === 'tools/list' ||
-      method === 'mcp/listTools' ||
-      method === 'session/list_tools' ||
-      method === 'mcp/list_tools'
-    ) {
+    if (method === 'tools/list' || method === 'mcp/listTools' || method === 'session/list_tools' || method === 'mcp/list_tools') {
       if (reqId !== undefined) {
-        this.sendResponse({
-          jsonrpc: '2.0',
-          id: reqId,
-          result: { tools: this.mcpServer.listTools() }
-        });
+        this.sendResponse({ jsonrpc: '2.0', id: reqId, result: { tools: this.mcpServer.listTools() } });
       }
       return;
     }
 
-    // MCP Read-Only Tool Execution Dispatcher
-    if (
-      method === 'mcp/callTool' ||
-      method === 'tools/call' ||
-      method === 'session/call_tool' ||
-      method === 'mcp/call_tool' ||
-      method === 'agent/callTool'
-    ) {
+    if (method === 'mcp/callTool' || method === 'tools/call' || method === 'session/call_tool' || method === 'mcp/call_tool' || method === 'agent/callTool') {
       const toolName = (req.params as any)?.name || (req.params as any)?.toolName;
       const toolArgs = (req.params as any)?.arguments || (req.params as any)?.args || {};
-
       try {
         const resultString = await this.mcpServer.executeTool(toolName, toolArgs);
         if (reqId !== undefined) {
           this.sendResponse({
-            jsonrpc: '2.0',
-            id: reqId,
+            jsonrpc: '2.0', id: reqId,
             result: { content: [{ type: 'text', text: sanitizeText(resultString) }] }
           });
         }
       } catch (err: unknown) {
         const error = err as Error;
         if (reqId !== undefined) {
-          this.sendResponse({
-            jsonrpc: '2.0',
-            id: reqId,
-            error: { code: -32603, message: error.message }
-          });
+          this.sendResponse({ jsonrpc: '2.0', id: reqId, error: { code: -32603, message: error.message } });
         }
       }
       return;
     }
+
+    // A request we do not implement must not hang the agent.
+    if (reqId !== undefined) {
+      this.sendResponse({ jsonrpc: '2.0', id: reqId, error: { code: -32601, message: `Method not found: ${method}` } });
+    }
   }
 
   public sendRequest<T = any>(method: string, params: Record<string, unknown> = {}): Promise<T> {
-    const id = this.messageIdCounter++;
-    const message: JsonRpcMessage = {
-      jsonrpc: '2.0',
-      id,
-      method,
-      params
-    };
+    if (!this.process || !this.process.stdin || this.process.stdin.destroyed) {
+      return Promise.reject(new Error(`ACP agent is not running; cannot send ${method}.`));
+    }
 
+    const id = this.messageIdCounter++;
+    const message: JsonRpcMessage = { jsonrpc: '2.0', id, method, params };
     ProtocolLogger.acpOutbound(method, id, params);
 
     return new Promise((resolve, reject) => {
@@ -278,7 +272,7 @@ export class AcpClientBridge {
   }
 
   private sendMessage(msg: JsonRpcMessage): void {
-    if (this.process && this.process.stdin && !this.process.stdin.destroyed) {
+    if (this.process?.stdin && !this.process.stdin.destroyed) {
       this.process.stdin.write(JSON.stringify(msg) + '\n');
     }
   }
@@ -287,25 +281,30 @@ export class AcpClientBridge {
     this.sendMessage(res);
   }
 
-  public stop(): void {
-    if (this.process) {
-      try {
-        this.process.kill('SIGTERM');
-        // Fallback kill after 2s if process hasn't terminated
-        const proc = this.process;
-        setTimeout(() => {
-          try {
-            if (proc && !proc.killed) {
-              proc.kill('SIGKILL');
-            }
-          } catch {
-            // Process already exited
-          }
-        }, 2000);
-      } catch {
-        // Ignored
-      }
-      this.process = null;
-    }
+  public async stop(): Promise<void> {
+    const proc = this.process;
+    if (!proc) return;
+
+    this.stopping = true;
+    this._rejectAllPending('ACP agent stopped by client.');
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      proc.once('close', finish);
+      try { proc.kill('SIGTERM'); } catch { finish(); return; }
+      setTimeout(() => {
+        if (!settled) {
+          try { proc.kill('SIGKILL'); } catch { /* already exited */ }
+          finish();
+        }
+      }, 2000);
+    });
+
+    if (this.process === proc) this.process = null;
   }
 }

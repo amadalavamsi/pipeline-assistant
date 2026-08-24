@@ -1,127 +1,118 @@
 /**
  * reporter.ts
  *
- * Handles two output channels for failure diagnostics:
- *   1. GitHub Actions Job Summary  — always written, visible on the failed-job Summary tab.
- *   2. Inline PR annotations       — emitted only when a pull-request context is present.
+ * Renders the ACP diagnosis into GitHub Actions outputs.
  *
- * Both functions consume the AI-generated markdown report from index.ts; no prompt changes needed.
+ * ACP is asked to emit a machine-readable JSON block in addition to Markdown.
+ * The JSON is authoritative for status/confidence/causality/annotations;
+ * Markdown remains the human-readable report and is used as a compatibility
+ * fallback when an older agent does not emit the JSON block.
  */
 
 import * as core from '@actions/core';
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+export type DiagnosisStatus = 'CONFIRMED' | 'LIKELY' | 'UNKNOWN';
+export type CommitCausality = 'INTRODUCED' | 'LIKELY_INTRODUCED' | 'PRE_EXISTING' | 'UNRELATED' | 'UNKNOWN';
 
 export interface Annotation {
   file: string;
   line: number;
   message: string;
+  severity?: 'error' | 'warning' | 'notice';
+}
+
+export interface AnalysisMetadata {
+  status: DiagnosisStatus;
+  confidence?: string;
+  commitCausality: CommitCausality;
+  rootCause?: string;
+  whatChanged?: string;
+  evidence?: string;
+  suggestedFix?: string;
+  filesInvolved?: string;
+  annotations: Annotation[];
 }
 
 export interface JobSummaryParams {
   jobName: string;
+  failedStep?: string;
   commitSha: string;
   author: string;
-  /** Human-readable trigger label, e.g. "push" or "PR #12" */
   triggerLabel: string;
   markdownReport: string;
 }
 
-// ---------------------------------------------------------------------------
-// Annotation Parser
-// ---------------------------------------------------------------------------
+const MACHINE_BLOCK_RE = /<!--\s*pipeline-assistant:analysis\s*\n([\s\S]*?)\n\s*-->/i;
 
 /**
- * Scan an AI-generated markdown report for common compiler / runtime error
- * file:line patterns and return structured annotations.
- *
- * Supported patterns:
- *  - TypeScript / ESLint  : src/foo.ts:10:5 - error TS2345: …
- *  - Python               : File "src/main.py", line 42
- *  - Jest / Node stack    : at Object.<anonymous> (test/foo.test.js:42:5)
- *  - Generic              : error at path/to/file.go:25
- *
- * Capped at 5 results (GitHub allows 10 annotations per step; buffer kept for safety).
+ * Extract and validate the machine-readable analysis block emitted by ACP.
+ * Invalid/missing blocks deliberately fall back to Markdown parsing.
  */
-export function parseAnnotations(text: string): Annotation[] {
-  const annotations: Annotation[] = [];
-  const seen = new Set<string>();
+export function parseAnalysisMetadata(markdown: string): AnalysisMetadata | null {
+  const match = markdown.match(MACHINE_BLOCK_RE);
+  if (!match) return null;
 
-  type PatternDef = {
-    regex: RegExp;
-    fileIdx: number;
-    lineIdx: number;
-    msgIdx: number; // -1 means build a default message
-  };
+  try {
+    const raw = JSON.parse(match[1]);
+    if (!raw || typeof raw !== 'object') return null;
 
-  const patterns: PatternDef[] = [
-    // TypeScript/ESLint: src/foo.ts:10:5 - error TS2345: Argument of type …
-    {
-      regex: /([^\s"'`(]+\.[a-z]{2,5}):(\d+):\d+\s*[-–]\s*(error\s+\S+[^\n]*)/gi,
-      fileIdx: 1,
-      lineIdx: 2,
-      msgIdx: 3
-    },
-    // Python: File "src/main.py", line 42
-    {
-      regex: /File "([^"]+\.[a-z]{2,5})",\s*line\s+(\d+)/gi,
-      fileIdx: 1,
-      lineIdx: 2,
-      msgIdx: -1
-    },
-    // Jest / Node.js stack: at Object.<anonymous> (test/foo.test.js:42:5)
-    {
-      regex: /at\s+\S+\s+\(([^\s)]+\.[a-z]{2,5}):(\d+):\d+\)/gi,
-      fileIdx: 1,
-      lineIdx: 2,
-      msgIdx: -1
-    },
-    // Generic: Error at path/to/file.go:25
-    {
-      regex: /(?:error|Error|ERROR)\s+at\s+([^\s:]+\.[a-z]{2,5}):(\d+)/gi,
-      fileIdx: 1,
-      lineIdx: 2,
-      msgIdx: -1
-    }
-  ];
+    const status = String(raw.diagnosis?.status || '').toUpperCase();
+    const allowedStatus: DiagnosisStatus[] = ['CONFIRMED', 'LIKELY', 'UNKNOWN'];
+    if (!allowedStatus.includes(status as DiagnosisStatus)) return null;
 
-  for (const { regex, fileIdx, lineIdx, msgIdx } of patterns) {
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(text)) !== null) {
-      if (annotations.length >= 5) break;
+    const causality = String(raw.diagnosis?.commitCausality || '').toUpperCase();
+    const allowedCausality: CommitCausality[] = [
+      'INTRODUCED', 'LIKELY_INTRODUCED', 'PRE_EXISTING', 'UNRELATED', 'UNKNOWN'
+    ];
+    if (!allowedCausality.includes(causality as CommitCausality)) return null;
 
-      const file = match[fileIdx]?.trim();
-      const line = parseInt(match[lineIdx], 10);
-      if (!file || isNaN(line)) continue;
+    const annotations: Annotation[] = Array.isArray(raw.annotations)
+      ? raw.annotations
+          .filter((a: any) => a && typeof a.file === 'string' && Number.isInteger(a.line) && a.line > 0 && typeof a.message === 'string')
+          .slice(0, 5)
+          .map((a: any) => ({
+            file: a.file.trim(),
+            line: a.line,
+            message: a.message.trim(),
+            severity: ['error', 'warning', 'notice'].includes(a.severity) ? a.severity : 'error'
+          }))
+      : [];
 
-      const dedupeKey = `${file}:${line}`;
-      if (seen.has(dedupeKey)) continue;
-      seen.add(dedupeKey);
-
-      const message =
-        msgIdx >= 0 && match[msgIdx]
-          ? match[msgIdx].trim()
-          : `Failure detected at ${file}:${line}`;
-
-      annotations.push({ file, line, message });
-    }
-    if (annotations.length >= 5) break;
+    return {
+      status: status as DiagnosisStatus,
+      confidence: normalizeConfidence(raw.diagnosis?.confidence),
+      commitCausality: causality as CommitCausality,
+      rootCause: asOptionalString(raw.rootCause?.summary),
+      whatChanged: asOptionalString(raw.changeImpact?.summary),
+      evidence: asOptionalString(raw.evidence?.summary),
+      suggestedFix: asOptionalString(raw.fix?.summary),
+      filesInvolved: Array.isArray(raw.filesInvolved)
+        ? raw.filesInvolved.filter((v: unknown) => typeof v === 'string').join('\n')
+        : asOptionalString(raw.filesInvolved),
+      annotations
+    };
+  } catch {
+    return null;
   }
+}
 
-  return annotations;
+function normalizeConfidence(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const pct = value <= 1 ? value * 100 : value;
+    return `${Math.round(Math.max(0, Math.min(100, pct)))}%`;
+  }
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  return undefined;
+}
+
+function asOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Legacy Markdown parser (compatibility fallback only)
 // ---------------------------------------------------------------------------
 
-/**
- * Extract the text body of a named section from the AI markdown report.
- * Searches for any heading line that contains `sectionKeyword` and returns
- * all content up to the next heading of the same or higher level.
- */
 function extractSection(markdown: string, sectionKeyword: string): string {
   const lines = markdown.split('\n');
   let capturing = false;
@@ -134,37 +125,52 @@ function extractSection(markdown: string, sectionKeyword: string): string {
       const level = headingMatch[1].length;
       const title = headingMatch[2];
 
-      if (title.includes(sectionKeyword)) {
+      if (title.toLowerCase().includes(sectionKeyword.toLowerCase())) {
         capturing = true;
         captureLevel = level;
         continue;
       }
 
-      if (capturing && level <= captureLevel) {
-        // Reached the next sibling or parent heading — stop.
-        break;
-      }
+      if (capturing && level <= captureLevel) break;
     }
 
-    if (capturing) {
-      buffer.push(line);
-    }
+    if (capturing) buffer.push(line);
   }
 
   return buffer.join('\n').trim();
 }
 
-/**
- * Strip markdown code fences (``` … ```) so the text can be embedded
- * safely inside an HTML <pre><code> block in the Job Summary.
- */
-function stripCodeFences(text: string): string {
-  return text.replace(/```[a-z]*\n?/gi, '').trim();
+function parseLegacyMetadata(markdown: string): AnalysisMetadata {
+  const diagnosisSection = extractSection(markdown, 'Diagnosis');
+  let status: DiagnosisStatus = 'UNKNOWN';
+
+  if (/^\s*(?:[-*]\s*)?\*?Status\*?\s*:\s*CONFIRMED\b/im.test(diagnosisSection)) status = 'CONFIRMED';
+  else if (/^\s*(?:[-*]\s*)?\*?Status\*?\s*:\s*LIKELY\b/im.test(diagnosisSection)) status = 'LIKELY';
+
+  const confidenceMatch = diagnosisSection.match(/^\s*(?:[-*]\s*)?\*?Confidence\*?\s*:\s*([^\n\r]+)/im);
+  const causalityMatch = markdown.match(/^\s*(?:[-*]\s*)?\*?(?:Commit Causality|Regression)\*?\s*:\s*([^\n\r]+)/im);
+  const causalityText = (causalityMatch?.[1] || '').toUpperCase();
+  const commitCausality: CommitCausality = causalityText.includes('INTRODUCED')
+    ? (causalityText.includes('LIKELY') ? 'LIKELY_INTRODUCED' : 'INTRODUCED')
+    : causalityText.includes('PRE_EXISTING') || causalityText.includes('PRE-EXISTING')
+      ? 'PRE_EXISTING'
+      : causalityText.includes('UNRELATED')
+        ? 'UNRELATED'
+        : 'UNKNOWN';
+
+  return {
+    status,
+    confidence: confidenceMatch?.[1]?.trim(),
+    commitCausality,
+    rootCause: extractSection(markdown, 'Root Cause') || undefined,
+    whatChanged: extractSection(markdown, 'What Changed') || undefined,
+    evidence: extractSection(markdown, 'Evidence') || extractSection(markdown, 'Log Evidence') || undefined,
+    suggestedFix: extractSection(markdown, 'Suggested Fix') || extractSection(markdown, 'Next Steps') || undefined,
+    filesInvolved: extractSection(markdown, 'Files Involved') || undefined,
+    annotations: []
+  };
 }
 
-/**
- * Escape HTML special characters so raw text is safe inside HTML elements.
- */
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -173,122 +179,75 @@ function escapeHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function stripMachineBlock(markdown: string): string {
+  return markdown.replace(MACHINE_BLOCK_RE, '').trim();
+}
+
 // ---------------------------------------------------------------------------
 // Job Summary writer
 // ---------------------------------------------------------------------------
 
-/**
- * Write a rich GitHub Actions Job Summary to $GITHUB_STEP_SUMMARY.
- *
- * Output layout:
- *  ┌──────────────────────────────────────────────────────────┐
- *  │  ❌ Pipeline Failure Analysis                             │
- *  ├──────────────┬──────────┬────────────┬───────────────────┤
- *  │  Failed Job  │  Commit  │  Author    │  Trigger          │
- *  ├──────────────┴──────────┴────────────┴───────────────────┤
- *  │  🔍 Root Cause                                            │
- *  │  <text>                                                   │
- *  │  📜 Log Evidence (collapsible)                            │
- *  │  💡 Suggested Fix                                         │
- *  │  ─────────────────────────────────────────────────────── │
- *  │  🤖 generated by pipeline-assistant                       │
- *  └──────────────────────────────────────────────────────────┘
- */
 export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
-  const { jobName, commitSha, author, triggerLabel, markdownReport } = params;
+  const { jobName, failedStep, commitSha, author, triggerLabel, markdownReport } = params;
+  const metadata = parseAnalysisMetadata(markdownReport) || parseLegacyMetadata(markdownReport);
+  const humanReport = stripMachineBlock(markdownReport);
 
-  const shortSha = commitSha !== 'N/A' && commitSha.length > 7
-    ? commitSha.substring(0, 7)
-    : commitSha;
-
-  // Pull named sections out of the AI report
-  const diagnosisSection = extractSection(markdownReport, 'Diagnosis');
-
-  let status = 'UNKNOWN';
-  if (/CONFIRMED/i.test(diagnosisSection) || /Status:\s*CONFIRMED/i.test(markdownReport)) {
-    status = 'CONFIRMED';
-  } else if (/LIKELY/i.test(diagnosisSection) || /Status:\s*LIKELY/i.test(markdownReport)) {
-    status = 'LIKELY';
-  } else if (/UNKNOWN/i.test(diagnosisSection) || /Status:\s*UNKNOWN/i.test(markdownReport)) {
-    status = 'UNKNOWN';
-  }
-
-  const confidenceMatch = diagnosisSection.match(/Confidence:\s*([^\n\r]+)/i) ||
-                          markdownReport.match(/## Confidence\s*\n+([^\n\r]+)/i);
-  const confidence = confidenceMatch ? confidenceMatch[1].trim() : (status === 'CONFIRMED' ? '90%' : (status === 'LIKELY' ? '70%' : '40%'));
-
+  const shortSha = commitSha !== 'N/A' && commitSha.length > 7 ? commitSha.substring(0, 7) : commitSha;
   const statusBadge =
-    status === 'CONFIRMED' ? '🟢 CONFIRMED' :
-    status === 'LIKELY' ? '🟡 LIKELY' : '⚪ UNKNOWN';
+    metadata.status === 'CONFIRMED' ? '🟢 CONFIRMED' :
+    metadata.status === 'LIKELY' ? '🟡 LIKELY' : '⚪ UNKNOWN';
+  const confidence = metadata.confidence || 'N/A';
+  const causalityLabel = metadata.commitCausality.replace(/_/g, ' ');
 
-  const rootCause =
-    extractSection(markdownReport, 'Root Cause') ||
-    '(See full report below)';
-
-  const whatChanged =
-    extractSection(markdownReport, 'What Changed');
-
-  const rawEvidence =
-    extractSection(markdownReport, 'Evidence') ||
-    extractSection(markdownReport, 'Error Log') ||
-    extractSection(markdownReport, 'Log Evidence') ||
-    extractSection(markdownReport, 'Log');
-
-  const rawFix =
-    extractSection(markdownReport, 'Suggested Fix / Next Steps') ||
-    extractSection(markdownReport, 'Suggested Fix') ||
-    extractSection(markdownReport, 'Next Steps') ||
-    extractSection(markdownReport, 'Fix');
-
-  const filesInvolved =
-    extractSection(markdownReport, 'Files Involved');
-
-  const cleanLog = escapeHtml(stripCodeFences(rawEvidence));
-  const cleanFix = escapeHtml(stripCodeFences(rawFix));
-
-  // Log evidence goes in a collapsible <details> to keep the summary compact
-  const logHtml = cleanLog
-    ? `<details><summary>Click to expand log evidence</summary><pre><code>${cleanLog}</code></pre></details>`
-    : '<em>No log evidence extracted.</em>';
-
-  const fixHtml = cleanFix
-    ? `<pre><code>${cleanFix}</code></pre>`
-    : '<em>No specific fix suggested.</em>';
+  const rootCause = metadata.rootCause || '(See full report below)';
+  const whatChanged = metadata.whatChanged;
+  const evidence = metadata.evidence;
+  const suggestedFix = metadata.suggestedFix;
+  const filesInvolved = metadata.filesInvolved;
 
   let summaryBuilder = core.summary
     .addHeading('❌ Pipeline Failure Analysis', 2)
     .addTable([
       [
         { data: 'Failed Job', header: true },
+        { data: 'Failed Step', header: true },
         { data: 'Commit', header: true },
-        { data: 'Author', header: true },
-        { data: 'Trigger', header: true },
         { data: 'Status', header: true },
-        { data: 'Confidence', header: true }
+        { data: 'Confidence', header: true },
+        { data: 'Commit Causality', header: true }
       ],
       [
         `<code>${escapeHtml(jobName)}</code>`,
+        `<code>${escapeHtml(failedStep || 'N/A')}</code>`,
         `<code>${escapeHtml(shortSha)}</code>`,
-        escapeHtml(author || '—'),
-        escapeHtml(triggerLabel),
         `<strong>${statusBadge}</strong>`,
-        `<code>${escapeHtml(confidence)}</code>`
+        `<code>${escapeHtml(confidence)}</code>`,
+        escapeHtml(causalityLabel)
       ]
-    ])
+      ]
+    )
+    .addHeading('⚡ TL;DR', 3)
+    .addRaw(`<p>${escapeHtml(rootCause)}</p>`)
     .addHeading('🔍 Root Cause', 3)
-    .addRaw(`<p>${escapeHtml(rootCause)}</p>`);
+    .addRaw(`<p>${escapeHtml(rootCause).replace(/\n/g, '<br/>')}</p>`);
 
   if (whatChanged) {
     summaryBuilder = summaryBuilder
-      .addHeading('📝 What Changed', 3)
+      .addHeading('🔄 Change Impact', 3)
       .addRaw(`<p>${escapeHtml(whatChanged).replace(/\n/g, '<br/>')}</p>`);
   }
 
+  if (evidence) {
+    summaryBuilder = summaryBuilder
+      .addHeading('📌 Key Evidence', 3)
+      .addRaw(`<p>${escapeHtml(evidence).replace(/\n/g, '<br/>')}</p>`);
+  }
+
   summaryBuilder = summaryBuilder
-    .addHeading('📜 Evidence', 3)
-    .addRaw(logHtml)
+    .addHeading('📜 Full Report', 3)
+    .addRaw(`<details><summary>View full ACP report</summary><pre><code>${escapeHtml(humanReport)}</code></pre></details>`)
     .addHeading('💡 Suggested Fix / Next Steps', 3)
-    .addRaw(fixHtml);
+    .addRaw(suggestedFix ? `<pre><code>${escapeHtml(suggestedFix)}</code></pre>` : '<em>No specific fix suggested.</em>');
 
   if (filesInvolved) {
     summaryBuilder = summaryBuilder
@@ -305,35 +264,33 @@ export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
     )
     .write();
 
-  core.info('[reporter] Job Summary written to $GITHUB_STEP_SUMMARY.');
+  core.info(`[reporter] Job Summary written. status=${metadata.status}, causality=${metadata.commitCausality}`);
 }
 
 // ---------------------------------------------------------------------------
 // PR annotation emitter
 // ---------------------------------------------------------------------------
 
-/**
- * Emit inline code annotations on the PR diff for each file:line error found
- * in the AI-generated report.
- *
- * ⚠️  Call this ONLY when a pull-request context is present (pullNumber is set).
- *     For push-to-main triggers, skip this entirely — there is no PR diff to annotate.
- */
 export function emitPrAnnotations(markdownReport: string): void {
-  const annotations = parseAnnotations(markdownReport);
-
-  if (annotations.length === 0) {
-    core.info('[reporter] No file:line patterns found in report — skipping PR annotations.');
+  const metadata = parseAnalysisMetadata(markdownReport);
+  if (!metadata) {
+    core.info('[reporter] No structured analysis block; skipping PR annotations rather than guessing from prose.');
     return;
   }
 
-  for (const annotation of annotations) {
+  if (metadata.annotations.length === 0) {
+    core.info('[reporter] No structured annotations returned — skipping PR annotations.');
+    return;
+  }
+
+  for (const annotation of metadata.annotations) {
     core.error(annotation.message, {
       title: '🤖 AI Root Cause',
       file: annotation.file,
-      startLine: annotation.line
+      startLine: annotation.line,
+      endLine: annotation.line
     });
   }
 
-  core.info(`[reporter] Emitted ${annotations.length} inline annotation(s) on PR diff.`);
+  core.info(`[reporter] Emitted ${metadata.annotations.length} validated AI annotation(s).`);
 }

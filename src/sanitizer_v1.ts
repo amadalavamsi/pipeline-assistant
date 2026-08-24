@@ -140,57 +140,37 @@ export function extractErrorLogWindow(fullLog: string, windowLines: number = 80)
   if (!fullLog) return '';
 
   const lines = fullLog.split('\n');
-  const radius = Math.max(10, Math.floor(windowLines / 2));
+  const errorIndices: number[] = [];
+
   const errorKeywords = [
-    /\berror\b/i,
-    /\bfailed\b/i,
-    /\bfatal\b/i,
-    /\bexception\b/i,
-    /\bpanic\b/i,
+    /error/i,
+    /failed/i,
+    /fatal/i,
+    /exception/i,
+    /panic/i,
     /exit status [1-9]/i,
-    /FAIL:/i,
+    /FAIL:/,
     /BUILD FAILED/i,
-    /npm ERR!/i,
-    /process completed with exit code [1-9]/i,
-    /command failed/i
+    /npm ERR!/,
+    /Terraform has created a resource.*error/i
   ];
 
-  const matches: number[] = [];
   lines.forEach((line, index) => {
-    if (errorKeywords.some(regex => regex.test(line))) matches.push(index);
+    if (errorKeywords.some(regex => regex.test(line))) {
+      errorIndices.push(index);
+    }
   });
 
-  if (matches.length === 0) {
+  if (errorIndices.length === 0) {
+    // Return the last N lines if no specific keyword matched
     return lines.slice(-Math.min(lines.length, windowLines)).join('\n');
   }
 
-  // Preserve context around both the earliest meaningful error and the final
-  // failure summary. The last error-looking line is often only a consequence
-  // such as "process exited with code 1".
-  const anchors = [matches[0], matches[matches.length - 1]];
-  const ranges: Array<[number, number]> = [];
+  // Take the last cluster of errors (most indicative of failure cause)
+  const targetIndex = errorIndices[errorIndices.length - 1];
+  const start = Math.max(0, targetIndex - Math.floor(windowLines / 2));
+  const end = Math.min(lines.length, targetIndex + Math.floor(windowLines / 2));
 
-  for (const anchor of anchors) {
-    const start = Math.max(0, anchor - radius);
-    const end = Math.min(lines.length, anchor + radius + 1);
-    ranges.push([start, end]);
-  }
-
-  ranges.sort((a, b) => a[0] - b[0]);
-  const merged: Array<[number, number]> = [];
-  for (const range of ranges) {
-    const previous = merged[merged.length - 1];
-    if (previous && range[0] <= previous[1] + 1) {
-      previous[1] = Math.max(previous[1], range[1]);
-    } else {
-      merged.push([...range]);
-    }
-  }
-
-  const selected: string[] = [];
-  for (const [start, end] of merged) {
-    selected.push(lines.slice(start, end).join('\n'));
-  }
-
-  return selected.join('\n\n--- additional failure context ---\n\n');
+  return lines.slice(start, end).join('\n');
 }
+
