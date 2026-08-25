@@ -30,6 +30,30 @@ export interface ReadOnlyMcpServer {
   executeTool(name: string, args: Record<string, unknown>): Promise<string>;
 }
 
+// Keep diff hunks and file headers instead of blindly taking the first N lines.
+// This reduces the chance that a large PR hides the relevant changed file.
+function selectDiffContext(lines: string[], maxLines: number): string {
+  if (lines.length <= maxLines) return lines.join('\n');
+
+  const headerIndices = lines.reduce<number[]>((acc, line, index) => {
+    if (line.startsWith('diff --git ') || line.startsWith('@@ ')) acc.push(index);
+    return acc;
+  }, []);
+
+  if (headerIndices.length === 0) return lines.slice(0, maxLines).join('\n');
+
+  const selected = new Set<number>();
+  for (const index of headerIndices) {
+    for (let i = Math.max(0, index - 2); i < Math.min(lines.length, index + 8); i++) {
+      selected.add(i);
+      if (selected.size >= maxLines) break;
+    }
+    if (selected.size >= maxLines) break;
+  }
+
+  return Array.from(selected).sort((a, b) => a - b).map(i => lines[i]).join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -60,9 +84,8 @@ export function createReadOnlyMcpServer(
               run_id: context.runId
             });
 
-            const failedJob = jobsResponse.data.jobs.find(
-              j => j.conclusion === 'failure' || j.status === 'in_progress'
-            );
+            const failedJobs = jobsResponse.data.jobs.filter(j => j.conclusion === 'failure');
+            const failedJob = failedJobs.find(j => j.steps?.some(step => step.conclusion === 'failure')) || failedJobs[0];
 
             if (!failedJob) {
               const res = JSON.stringify({ message: 'No failed jobs found in workflow run.' });
@@ -83,6 +106,7 @@ export function createReadOnlyMcpServer(
             const result = JSON.stringify({
               jobName: failedJob.name,
               jobId: failedJob.id,
+              failedStep: failedJob.steps?.find(step => step.conclusion === 'failure')?.name || 'Job-level failure',
               errorLogWindow: errorWindow
             });
 
@@ -113,7 +137,7 @@ export function createReadOnlyMcpServer(
             const rawDiff = String(diffResponse.data);
             const sanitized = sanitizeText(rawDiff);
             const diffLines = sanitized.split('\n');
-            const limitedDiff = diffLines.slice(0, context.maxDiffLines).join('\n');
+            const limitedDiff = selectDiffContext(diffLines, context.maxDiffLines);
 
             const result = JSON.stringify({
               pullNumber: context.pullNumber,
@@ -176,7 +200,7 @@ export function createReadOnlyMcpServer(
             const rawDiff = String(commitResponse.data);
             const sanitized = sanitizeText(rawDiff);
             const diffLines = sanitized.split('\n');
-            const limitedDiff = diffLines.slice(0, maxLines).join('\n');
+            const limitedDiff = selectDiffContext(diffLines, maxLines);
 
             const result = JSON.stringify({
               commitSha: headSha,
@@ -257,7 +281,7 @@ export function createReadOnlyMcpServer(
             const rawDiff = String(commitResponse.data);
             const sanitized = sanitizeText(rawDiff);
             const diffLines = sanitized.split('\n');
-            const limitedDiff = diffLines.slice(0, maxLines).join('\n');
+            const limitedDiff = selectDiffContext(diffLines, maxLines);
 
             const result = JSON.stringify({
               commitSha,
@@ -290,20 +314,19 @@ export function createReadOnlyMcpServer(
             }
 
             // Sensitive file blacklist — enterprise security safeguard
-            const sensitiveFilePatterns = [
-              /^\.env(\..+)?$/i,
-              /^\.git\//i,
-              /^\.aws\//i,
-              /^\.ssh\//i,
-              /id_rsa/i,
-              /id_ed25519/i,
-              /id_dsa/i,
-              /\.(pem|key|p12|pfx|pkcs12|keystore|jks)$/i,
-              /credentials(\.json|\.ya?ml|\.ini)?$/i,
-              /secrets?(\.json|\.ya?ml)?$/i
-            ];
+            const pathSegments = normalizedPath.split('/').filter(Boolean);
+            const basename = pathSegments[pathSegments.length - 1] || '';
+            const sensitiveFile =
+              pathSegments.includes('.git') ||
+              pathSegments.includes('.aws') ||
+              pathSegments.includes('.ssh') ||
+              /^\.env(?:\..+)?$/i.test(basename) ||
+              /^(?:id_rsa|id_ed25519|id_dsa)$/i.test(basename) ||
+              /\.(pem|key|p12|pfx|pkcs12|keystore|jks)$/i.test(basename) ||
+              /^credentials(?:\.json|\.ya?ml|\.ini)?$/i.test(basename) ||
+              /^secrets?(?:\.json|\.ya?ml)?$/i.test(basename);
 
-            if (sensitiveFilePatterns.some(pattern => pattern.test(normalizedPath))) {
+            if (sensitiveFile) {
               const err = `Security Gate: Access to sensitive or credential file "${normalizedPath}" is blocked.`;
               ProtocolLogger.mcpToolError(name, err);
               return JSON.stringify({ error: err });

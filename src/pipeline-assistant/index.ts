@@ -96,7 +96,7 @@ async function run(): Promise<void> {
     const agentArgsInput = core.getInput('agent-args', { required: false }) || ' --acp --stdio';
     const agentArgs = agentArgsInput.split(' ').filter(Boolean);
 
-    console.log(`\n🔍 Pipeline Assistant (ACP + Read-Only MCP)`);
+    console.log(`\n🔍 Pipeline Assistant (ACP + Read-Only Evidence)`);
     console.log(`📁 Target: ${owner}/${repo} | Run ID: ${runId || 'N/A'} | PR: #${pullNumber || 'N/A'}`);
     console.log(`📝 Full debug log → ${ProtocolLogger.getLogFilePath()}`);
     if (cliOptions.noExecute) {
@@ -104,7 +104,8 @@ async function run(): Promise<void> {
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: Create a single MCP server instance (reused across the entire run)
+    // Step 1: Prepare the legacy read-only MCP dispatcher. The primary path
+    // pre-fetches evidence, so session/new intentionally advertises no MCP servers.
     // -----------------------------------------------------------------------
     const mcpServer = createReadOnlyMcpServer(octokit, {
       owner,
@@ -113,6 +114,9 @@ async function run(): Promise<void> {
       pullNumber,
       maxDiffLines
     });
+    // The production prompt path pre-fetches all evidence. MCP remains available
+    // for the bridge's legacy read-only dispatcher but is not advertised via session/new.
+
 
     // -----------------------------------------------------------------------
     // Step 2: Offline / local file testing support
@@ -138,94 +142,117 @@ async function run(): Promise<void> {
     const isLiveCi = runId > 0 && githubToken !== 'dummy-local-token';
     const hasPullRequest = Boolean(pullNumber);
 
-    const systemPrompt = getSystemPrompt({
-      jobName: JOB_NAME,
-      commitSha: 'HEAD',
-      author: 'developer'
-    });
-
-    let userPrompt: string;
+    let targetCommitSha = 'HEAD';
+    let targetCommitMessage = '';
+    let targetAuthor = 'developer';
+    let targetJobName = JOB_NAME;
+    let targetFailedStep = 'Unknown failed step';
+    let targetErrorLog = offlineErrorLog;
+    let targetDiffSnippet = offlineDiffSnippet;
+    let previousSuccessfulRunId: number | undefined;
+    let previousSuccessfulCommitSha: string | undefined;
 
     if (isLiveCi) {
-      console.log('📡 Fetching failure evidence (logs, diff, commit metadata)...');
+      console.log('📡 Fetching failure evidence (logs, trigger-commit diff, commit metadata)...');
 
-      // --- Fetch commit metadata ---
-      let commitSha = 'HEAD';
-      let commitMessage = '';
-      let commitAuthor = 'developer';
-      let jobName = JOB_NAME;
+      // --- Fetch target run metadata ---
       try {
-        const run = await octokit.rest.actions.getWorkflowRun({
-          owner, repo, run_id: runId
-        });
-        commitSha = run.data.head_sha || 'HEAD';
-        commitMessage = run.data.head_commit?.message || '';
-        commitAuthor = run.data.head_commit?.author?.name || 'developer';
-        console.log(`  ✅ Commit: ${commitSha.substring(0, 7)} by ${commitAuthor}`);
+        const run = await octokit.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+        targetCommitSha = run.data.head_sha || 'HEAD';
+        targetCommitMessage = run.data.head_commit?.message || '';
+        targetAuthor = run.data.head_commit?.author?.name || 'developer';
+        console.log(`  ✅ Commit: ${targetCommitSha.substring(0, 7)} by ${targetAuthor}`);
+
+        // Find the most recent successful run of the same workflow. This gives
+        // ACP a factual baseline for regression analysis instead of guessing
+        // whether the current commit introduced an already-existing failure.
+        if (run.data.workflow_id) {
+          try {
+            const history = await octokit.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: run.data.workflow_id, status: 'success', per_page: 20
+            });
+            const previous = history.data.workflow_runs.find(r => r.id !== runId && r.conclusion === 'success');
+            if (previous) {
+              previousSuccessfulRunId = previous.id;
+              previousSuccessfulCommitSha = previous.head_sha;
+              console.log(`  ✅ Regression baseline: run ${previous.id}, commit ${previous.head_sha.substring(0, 7)}`);
+            }
+          } catch (historyErr) {
+            console.warn(`  ⚠️ Could not fetch previous successful run: ${(historyErr as Error).message}`);
+          }
+        }
       } catch (e) {
         console.warn(`  ⚠️ Could not fetch commit metadata: ${(e as Error).message}`);
       }
 
-      // --- Fetch failed job logs only ---
-      let errorLog = '';
+      // --- Identify the actual failed job and failed step ---
       try {
         const jobsRes = await octokit.rest.actions.listJobsForWorkflowRun({
-          owner, repo, run_id: runId
+          owner, repo, run_id: runId, per_page: 100
         });
-        const failedJob = jobsRes.data.jobs.find(
-          j => j.conclusion === 'failure' || j.status === 'in_progress'
-        );
+        const failedJobs = jobsRes.data.jobs.filter(j => j.conclusion === 'failure');
+        const failedJob = failedJobs.find(j => j.steps?.some(step => step.conclusion === 'failure')) || failedJobs[0];
+
         if (failedJob) {
-          jobName = failedJob.name;
+          targetJobName = failedJob.name;
+          const failedStep = failedJob.steps?.find(step => step.conclusion === 'failure');
+          targetFailedStep = failedStep?.name || 'Job-level failure';
+
           const logsRes = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
             owner, repo, job_id: failedJob.id
           });
-          errorLog = extractErrorLogWindow(sanitizeText(String(logsRes.data)), 120);
-          console.log(`  ✅ Logs: extracted error window for job "${failedJob.name}"`);
+          targetErrorLog = extractErrorLogWindow(sanitizeText(String(logsRes.data)), 160);
+          console.log(`  ✅ Logs: job="${failedJob.name}", failedStep="${targetFailedStep}"`);
+
+          if (failedJobs.length > 1) {
+            console.warn(`  ⚠️ Workflow has ${failedJobs.length} failed jobs; analysing "${failedJob.name}".`);
+          }
         } else {
-          console.warn('  ⚠️ No failed job found in workflow run.');
+          console.warn('  ⚠️ No conclusively failed job found in workflow run.');
         }
       } catch (e) {
         console.warn(`  ⚠️ Could not fetch job logs: ${(e as Error).message}`);
       }
 
-      // --- Fetch code diff only ---
-      let diffSnippet = '';
+      // --- Always fetch the trigger commit diff. A PR diff can contain many commits ---
       try {
-        if (hasPullRequest && pullNumber) {
-          const diffRes = await octokit.rest.pulls.get({
-            owner, repo, pull_number: pullNumber,
-            mediaType: { format: 'diff' }
-          });
-          diffSnippet = sanitizeText(String(diffRes.data))
-            .split('\n').slice(0, maxDiffLines).join('\n');
-          console.log('  ✅ Diff: fetched PR diff');
-        } else {
-          const commitRes = await octokit.rest.repos.getCommit({
-            owner, repo, ref: commitSha,
-            mediaType: { format: 'diff' }
-          });
-          diffSnippet = sanitizeText(String(commitRes.data))
-            .split('\n').slice(0, maxDiffLines).join('\n');
-          console.log('  ✅ Diff: fetched commit diff');
-        }
+        const commitRes = await octokit.rest.repos.getCommit({
+          owner, repo, ref: targetCommitSha, mediaType: { format: 'diff' }
+        });
+        targetDiffSnippet = sanitizeText(String(commitRes.data))
+          .split('\n').slice(0, maxDiffLines).join('\n');
+        console.log('  ✅ Diff: fetched trigger-commit diff');
       } catch (e) {
-        console.warn(`  ⚠️ Could not fetch diff: ${(e as Error).message}`);
+        console.warn(`  ⚠️ Could not fetch trigger-commit diff: ${(e as Error).message}`);
       }
-
-      userPrompt = buildLiveCiUserPromptWithData({
-        owner, repo, runId,
-        commitSha, commitMessage, author: commitAuthor,
-        jobName, errorLog, diffSnippet,
-        hasPullRequest, pullNumber
-      });
-    } else {
-      userPrompt = buildOfflineUserPrompt({
-        errorLog: offlineErrorLog,
-        diffSnippet: offlineDiffSnippet,
-        jobName: JOB_NAME
-      });
     }
+
+    const systemPrompt = getSystemPrompt({
+      jobName: targetJobName,
+      commitSha: targetCommitSha,
+      author: targetAuthor
+    });
+
+    const userPrompt = isLiveCi
+      ? buildLiveCiUserPromptWithData({
+          owner, repo, runId,
+          commitSha: targetCommitSha,
+          commitMessage: targetCommitMessage,
+          author: targetAuthor,
+          jobName: targetJobName,
+          failedStep: targetFailedStep,
+          errorLog: targetErrorLog,
+          diffSnippet: targetDiffSnippet,
+          previousSuccessfulRunId,
+          previousSuccessfulCommitSha,
+          hasPullRequest,
+          pullNumber
+        })
+      : buildOfflineUserPrompt({
+          errorLog: targetErrorLog,
+          diffSnippet: targetDiffSnippet,
+          jobName: targetJobName
+        });
 
     // -----------------------------------------------------------------------
     // Step 4: Handle --no-execute (dry-run mode)
@@ -311,15 +338,15 @@ async function run(): Promise<void> {
       const error = acpErr as Error;
       console.warn(`[ACP Process Notification] ${error.message}`);
       markdownReport = formatReportTemplate({
-        jobName: JOB_NAME,
-        commitSha: 'N/A',
-        author: 'N/A',
+        jobName: targetJobName,
+        commitSha: targetCommitSha,
+        author: targetAuthor,
         rootCause: FALLBACK.rootCause,
-        logEvidence: offlineErrorLog || '(no log data available in fallback)',
+        logEvidence: targetErrorLog || '(no log data available in fallback)',
         suggestedFix: FALLBACK.suggestedFix
       });
     } finally {
-      acpBridge.stop();
+      await acpBridge.stop();
     }
 
     markdownReport = sanitizeText(markdownReport);
@@ -333,11 +360,11 @@ async function run(): Promise<void> {
       console.warn('\n⚠️  [WARNING] Markdown report is empty — the ACP agent produced no output.');
       console.warn(`    Check the full debug log for details: ${ProtocolLogger.getLogFilePath()}`);
       markdownReport = formatReportTemplate({
-        jobName: JOB_NAME,
-        commitSha: 'N/A',
-        author: 'N/A',
+        jobName: targetJobName,
+        commitSha: targetCommitSha,
+        author: targetAuthor,
         rootCause: FALLBACK.noOutputRootCause,
-        logEvidence: offlineErrorLog || '(no log data — check acp-debug.log)',
+        logEvidence: targetErrorLog || '(no log data — check acp-debug.log)',
         suggestedFix: `${FALLBACK.noOutputSuggestedFix}: ${ProtocolLogger.getLogFilePath()}`
       });
     }
@@ -358,9 +385,10 @@ async function run(): Promise<void> {
     const triggerLabel = pullNumber ? `PR #${pullNumber}` : (context.eventName || 'push');
     try {
       await writeJobSummary({
-        jobName: JOB_NAME,
-        commitSha: context.sha || 'HEAD',
-        author: context.actor || 'developer',
+        jobName: targetJobName,
+        failedStep: targetFailedStep,
+        commitSha: targetCommitSha,
+        author: targetAuthor,
         triggerLabel,
         markdownReport
       });
@@ -418,7 +446,9 @@ async function run(): Promise<void> {
       }
     }
 
-    core.setOutput('failed-job-name', JOB_NAME);
+    core.setOutput('failed-job-name', targetJobName);
+    core.setOutput('failed-step-name', targetFailedStep);
+    core.setOutput('target-commit-sha', targetCommitSha);
     core.setOutput('analysis-report', markdownReport);
     console.log('🎉 Pipeline Assistant completed successfully.');
 
