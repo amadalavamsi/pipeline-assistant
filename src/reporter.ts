@@ -1,12 +1,12 @@
 /**
  * reporter.ts
  *
- * Renders the ACP diagnosis into GitHub Actions outputs.
+ * Renders ACP diagnosis into GitHub Actions outputs.
  *
- * ACP is asked to emit a machine-readable JSON block in addition to Markdown.
- * The JSON is authoritative for status/confidence/causality/annotations;
- * Markdown remains the human-readable report and is used as a compatibility
- * fallback when an older agent does not emit the JSON block.
+ * Safety rule: the machine-readable analysis block is authoritative for
+ * status/causality/confidence/annotations. If it is missing or invalid we do
+ * NOT infer a diagnosis from prose. An unstructured AI answer is useful as a
+ * report, but it is not trusted enough to drive badges or PR annotations.
  */
 
 import * as core from '@actions/core';
@@ -29,8 +29,10 @@ export interface AnalysisMetadata {
   whatChanged?: string;
   evidence?: string;
   suggestedFix?: string;
+  fixPatch?: string;
   filesInvolved?: string;
   annotations: Annotation[];
+  structured: boolean;
 }
 
 export interface JobSummaryParams {
@@ -40,14 +42,12 @@ export interface JobSummaryParams {
   author: string;
   triggerLabel: string;
   markdownReport: string;
+  changedLines?: Set<string>;
 }
 
 const MACHINE_BLOCK_RE = /<!--\s*pipeline-assistant:analysis\s*\n([\s\S]*?)\n\s*-->/i;
 
-/**
- * Extract and validate the machine-readable analysis block emitted by ACP.
- * Invalid/missing blocks deliberately fall back to Markdown parsing.
- */
+/** Parse and validate the machine-readable block. Never trust prose for diagnosis state. */
 export function parseAnalysisMetadata(markdown: string): AnalysisMetadata | null {
   const match = markdown.match(MACHINE_BLOCK_RE);
   if (!match) return null;
@@ -66,52 +66,58 @@ export function parseAnalysisMetadata(markdown: string): AnalysisMetadata | null
     ];
     if (!allowedCausality.includes(causality as CommitCausality)) return null;
 
+    const confidenceValue = raw.diagnosis?.confidence;
+    if (typeof confidenceValue !== 'number' || !Number.isFinite(confidenceValue) || confidenceValue < 0 || confidenceValue > 1) {
+      return null;
+    }
+    // Enforce the same confidence/status contract on the host side. This keeps
+    // an inconsistent model response from becoming a misleading green badge.
+    if ((status === 'CONFIRMED' && confidenceValue < 0.85) ||
+        (status === 'LIKELY' && (confidenceValue < 0.60 || confidenceValue >= 0.85)) ||
+        (status === 'UNKNOWN' && confidenceValue >= 0.60)) {
+      return null;
+    }
+
     const annotations: Annotation[] = Array.isArray(raw.annotations)
       ? raw.annotations
           .filter((a: any) => a && typeof a.file === 'string' && Number.isInteger(a.line) && a.line > 0 && typeof a.message === 'string')
           .slice(0, 5)
           .map((a: any) => ({
-            file: a.file.trim(),
+            file: normalizeRepoPath(a.file),
             line: a.line,
             message: a.message.trim(),
             severity: ['error', 'warning', 'notice'].includes(a.severity) ? a.severity : 'error'
           }))
+          .filter((a: Annotation) => a.file.length > 0 && a.file.length <= 500 && a.message.length > 0 && a.message.length <= 1000)
       : [];
 
     return {
       status: status as DiagnosisStatus,
-      confidence: normalizeConfidence(raw.diagnosis?.confidence),
+      confidence: `${Math.round(confidenceValue * 100)}%`,
       commitCausality: causality as CommitCausality,
       rootCause: asOptionalString(raw.rootCause?.summary),
       whatChanged: asOptionalString(raw.changeImpact?.summary),
       evidence: asOptionalString(raw.evidence?.summary),
       suggestedFix: asOptionalString(raw.fix?.summary),
+      fixPatch: asOptionalString(raw.fix?.patch),
       filesInvolved: Array.isArray(raw.filesInvolved)
         ? raw.filesInvolved.filter((v: unknown) => typeof v === 'string').join('\n')
         : asOptionalString(raw.filesInvolved),
-      annotations
+      annotations,
+      structured: true
     };
   } catch {
     return null;
   }
 }
 
-function normalizeConfidence(value: unknown): string | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    const pct = value <= 1 ? value * 100 : value;
-    return `${Math.round(Math.max(0, Math.min(100, pct)))}%`;
-  }
-  if (typeof value === 'string' && value.trim()) return value.trim();
-  return undefined;
+function normalizeRepoPath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, '');
 }
 
 function asOptionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
-
-// ---------------------------------------------------------------------------
-// Legacy Markdown parser (compatibility fallback only)
-// ---------------------------------------------------------------------------
 
 function extractSection(markdown: string, sectionKeyword: string): string {
   const lines = markdown.split('\n');
@@ -124,50 +130,34 @@ function extractSection(markdown: string, sectionKeyword: string): string {
     if (headingMatch) {
       const level = headingMatch[1].length;
       const title = headingMatch[2];
-
       if (title.toLowerCase().includes(sectionKeyword.toLowerCase())) {
         capturing = true;
         captureLevel = level;
         continue;
       }
-
       if (capturing && level <= captureLevel) break;
     }
-
     if (capturing) buffer.push(line);
   }
-
   return buffer.join('\n').trim();
 }
 
-function parseLegacyMetadata(markdown: string): AnalysisMetadata {
-  const diagnosisSection = extractSection(markdown, 'Diagnosis');
-  let status: DiagnosisStatus = 'UNKNOWN';
-
-  if (/^\s*(?:[-*]\s*)?\*?Status\*?\s*:\s*CONFIRMED\b/im.test(diagnosisSection)) status = 'CONFIRMED';
-  else if (/^\s*(?:[-*]\s*)?\*?Status\*?\s*:\s*LIKELY\b/im.test(diagnosisSection)) status = 'LIKELY';
-
-  const confidenceMatch = diagnosisSection.match(/^\s*(?:[-*]\s*)?\*?Confidence\*?\s*:\s*([^\n\r]+)/im);
-  const causalityMatch = markdown.match(/^\s*(?:[-*]\s*)?\*?(?:Commit Causality|Regression)\*?\s*:\s*([^\n\r]+)/im);
-  const causalityText = (causalityMatch?.[1] || '').toUpperCase();
-  const commitCausality: CommitCausality = causalityText.includes('INTRODUCED')
-    ? (causalityText.includes('LIKELY') ? 'LIKELY_INTRODUCED' : 'INTRODUCED')
-    : causalityText.includes('PRE_EXISTING') || causalityText.includes('PRE-EXISTING')
-      ? 'PRE_EXISTING'
-      : causalityText.includes('UNRELATED')
-        ? 'UNRELATED'
-        : 'UNKNOWN';
-
+/**
+ * Compatibility renderer for an old/invalid agent response. It deliberately
+ * marks the diagnosis as UNKNOWN and never creates annotations from prose.
+ */
+function parseUntrustedMarkdown(_markdown: string): AnalysisMetadata {
   return {
-    status,
-    confidence: confidenceMatch?.[1]?.trim(),
-    commitCausality,
-    rootCause: extractSection(markdown, 'Root Cause') || undefined,
-    whatChanged: extractSection(markdown, 'What Changed') || undefined,
-    evidence: extractSection(markdown, 'Evidence') || extractSection(markdown, 'Log Evidence') || undefined,
-    suggestedFix: extractSection(markdown, 'Suggested Fix') || extractSection(markdown, 'Next Steps') || undefined,
-    filesInvolved: extractSection(markdown, 'Files Involved') || undefined,
-    annotations: []
+    status: 'UNKNOWN',
+    confidence: undefined,
+    commitCausality: 'UNKNOWN',
+    rootCause: undefined,
+    whatChanged: undefined,
+    evidence: undefined,
+    suggestedFix: undefined,
+    filesInvolved: undefined,
+    annotations: [],
+    structured: false
   };
 }
 
@@ -183,26 +173,32 @@ function stripMachineBlock(markdown: string): string {
   return markdown.replace(MACHINE_BLOCK_RE, '').trim();
 }
 
-// ---------------------------------------------------------------------------
-// Job Summary writer
-// ---------------------------------------------------------------------------
+function normalizeChangedLineKey(file: string, line: number): string {
+  return `${normalizeRepoPath(file)}:${line}`;
+}
+
+export function stripMachineAnalysisBlock(markdown: string): string {
+  return stripMachineBlock(markdown);
+}
 
 export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
-  const { jobName, failedStep, commitSha, author, triggerLabel, markdownReport } = params;
-  const metadata = parseAnalysisMetadata(markdownReport) || parseLegacyMetadata(markdownReport);
+  const { jobName, failedStep, commitSha, author, triggerLabel, markdownReport, changedLines } = params;
+  const metadata = parseAnalysisMetadata(markdownReport) || parseUntrustedMarkdown(markdownReport);
   const humanReport = stripMachineBlock(markdownReport);
 
   const shortSha = commitSha !== 'N/A' && commitSha.length > 7 ? commitSha.substring(0, 7) : commitSha;
   const statusBadge =
     metadata.status === 'CONFIRMED' ? '🟢 CONFIRMED' :
-    metadata.status === 'LIKELY' ? '🟡 LIKELY' : '⚪ UNKNOWN';
+    metadata.status === 'LIKELY' ? '🟡 LIKELY' : '⚪ UNKNOWN / UNVERIFIED';
   const confidence = metadata.confidence || 'N/A';
   const causalityLabel = metadata.commitCausality.replace(/_/g, ' ');
 
-  const rootCause = metadata.rootCause || '(See full report below)';
+  const rootCause = metadata.structured && metadata.rootCause
+    ? metadata.rootCause
+    : 'No machine-validated root-cause diagnosis is available. The AI output is shown below for context only.';
   const whatChanged = metadata.whatChanged;
   const evidence = metadata.evidence;
-  const suggestedFix = metadata.suggestedFix;
+  const suggestedFix = metadata.structured ? metadata.suggestedFix : undefined;
   const filesInvolved = metadata.filesInvolved;
 
   let summaryBuilder = core.summary
@@ -224,10 +220,19 @@ export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
         `<code>${escapeHtml(confidence)}</code>`,
         escapeHtml(causalityLabel)
       ]
-      ]
-    )
+    ])
+    .addRaw(`<p><strong>Trigger:</strong> ${escapeHtml(triggerLabel)}</p>`)
+    .addRaw(`<p><strong>Author:</strong> ${escapeHtml(author)}</p>`)
     .addHeading('⚡ TL;DR', 3)
-    .addRaw(`<p>${escapeHtml(rootCause)}</p>`)
+    .addRaw(`<p>${escapeHtml(rootCause).replace(/\n/g, '<br/>')}</p>`);
+
+  if (!metadata.structured) {
+    summaryBuilder = summaryBuilder.addRaw(
+      '<p>⚠️ <strong>AI output was not machine-validated.</strong> Status, confidence, commit causality, and PR annotations were intentionally not inferred from prose.</p>'
+    );
+  }
+
+  summaryBuilder = summaryBuilder
     .addHeading('🔍 Root Cause', 3)
     .addRaw(`<p>${escapeHtml(rootCause).replace(/\n/g, '<br/>')}</p>`);
 
@@ -247,7 +252,12 @@ export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
     .addHeading('📜 Full Report', 3)
     .addRaw(`<details><summary>View full ACP report</summary><pre><code>${escapeHtml(humanReport)}</code></pre></details>`)
     .addHeading('💡 Suggested Fix / Next Steps', 3)
-    .addRaw(suggestedFix ? `<pre><code>${escapeHtml(suggestedFix)}</code></pre>` : '<em>No specific fix suggested.</em>');
+    .addRaw(suggestedFix ? `<p>${escapeHtml(suggestedFix).replace(/\n/g, '<br/>')}</p>` : '<em>No specific fix suggested.</em>');
+
+  if (metadata.fixPatch) {
+    summaryBuilder = summaryBuilder
+      .addRaw(`<pre><code>${escapeHtml(metadata.fixPatch)}</code></pre>`);
+  }
 
   if (filesInvolved) {
     summaryBuilder = summaryBuilder
@@ -257,33 +267,43 @@ export async function writeJobSummary(params: JobSummaryParams): Promise<void> {
 
   await summaryBuilder
     .addSeparator()
-    .addRaw(
-      '<p><sub>🤖 Report generated by ' +
-      '<a href="https://github.com/amadalavamsi/pipeline-assistant">pipeline-assistant</a>' +
-      ' via Agent Client Protocol (ACP)</sub></p>'
-    )
+    .addRaw('<p><sub>🤖 Report generated by <a href="https://github.com/amadalavamsi/pipeline-assistant">pipeline-assistant</a> via Agent Client Protocol (ACP)</sub></p>')
     .write();
 
-  core.info(`[reporter] Job Summary written. status=${metadata.status}, causality=${metadata.commitCausality}`);
+  core.info(`[reporter] Job Summary written. structured=${metadata.structured}, status=${metadata.status}, causality=${metadata.commitCausality}`);
 }
 
-// ---------------------------------------------------------------------------
-// PR annotation emitter
-// ---------------------------------------------------------------------------
-
-export function emitPrAnnotations(markdownReport: string): void {
+/**
+ * Emit only evidence-backed annotations. For PRs, an annotation is useful only
+ * when the line is actually part of the triggering commit. This avoids pointing
+ * developers at unchanged/pre-existing code as though their PR introduced it.
+ */
+export function emitPrAnnotations(markdownReport: string, changedLines?: Set<string>): void {
   const metadata = parseAnalysisMetadata(markdownReport);
   if (!metadata) {
-    core.info('[reporter] No structured analysis block; skipping PR annotations rather than guessing from prose.');
+    core.info('[reporter] No structured analysis block; skipping PR annotations.');
     return;
   }
 
-  if (metadata.annotations.length === 0) {
-    core.info('[reporter] No structured annotations returned — skipping PR annotations.');
+  // LIKELY/UNKNOWN diagnoses are intentionally not annotated inline. An inline
+  // red error marker is too strong a signal when the model has not established it.
+  if (metadata.status !== 'CONFIRMED') {
+    core.info(`[reporter] Diagnosis is ${metadata.status}; skipping PR annotations to avoid false positives.`);
     return;
   }
 
-  for (const annotation of metadata.annotations) {
+  if (!changedLines || changedLines.size === 0) {
+    core.info('[reporter] No trigger-commit changed-line map; skipping PR annotations.');
+    return;
+  }
+
+  const validated = metadata.annotations.filter(a => changedLines.has(normalizeChangedLineKey(a.file, a.line)));
+  if (validated.length === 0) {
+    core.info('[reporter] No annotations point to lines changed by the triggering commit; skipping PR annotations.');
+    return;
+  }
+
+  for (const annotation of validated) {
     core.error(annotation.message, {
       title: '🤖 AI Root Cause',
       file: annotation.file,
@@ -292,5 +312,5 @@ export function emitPrAnnotations(markdownReport: string): void {
     });
   }
 
-  core.info(`[reporter] Emitted ${metadata.annotations.length} validated AI annotation(s).`);
+  core.info(`[reporter] Emitted ${validated.length} evidence-backed AI annotation(s).`);
 }

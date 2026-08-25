@@ -2,13 +2,13 @@ import * as core from '@actions/core';
 import * as github from '@actions/github';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createReadOnlyMcpServer } from './mcp-tools';
+import { createReadOnlyMcpServer, extractChangedLinesFromDiff, selectDiffContext } from './mcp-tools';
 import { AcpClientBridge } from './acp-client';
 import { parseCliArgs } from './cli-parser';
 import { getSystemPrompt, formatReportTemplate } from './templates';
 import { sanitizeText, extractErrorLogWindow, initializeEnvSecretMasking, registerSecret } from './sanitizer';
 import { ProtocolLogger } from './logger';
-import { writeJobSummary, emitPrAnnotations } from './reporter';
+import { writeJobSummary, emitPrAnnotations, stripMachineAnalysisBlock } from './reporter';
 import { ACP_CAPABILITIES, BOT_COMMENT_SIGNATURE, JOB_NAME, FALLBACK } from './config';
 import { buildLiveCiUserPromptWithData, buildOfflineUserPrompt } from './prompts';
 
@@ -151,6 +151,13 @@ async function run(): Promise<void> {
     let targetDiffSnippet = offlineDiffSnippet;
     let previousSuccessfulRunId: number | undefined;
     let previousSuccessfulCommitSha: string | undefined;
+    let previousSuccessfulJobName: string | undefined;
+    let previousSuccessfulJobPassed = false;
+    let targetWorkflowId: number | undefined;
+    let targetBranch: string | undefined;
+    let targetCreatedAt: string | undefined;
+    let targetChangedLines = new Set<string>();
+    let targetTriggerEvent = context.eventName || 'workflow_run';
 
     if (isLiveCi) {
       console.log('📡 Fetching failure evidence (logs, trigger-commit diff, commit metadata)...');
@@ -161,26 +168,12 @@ async function run(): Promise<void> {
         targetCommitSha = run.data.head_sha || 'HEAD';
         targetCommitMessage = run.data.head_commit?.message || '';
         targetAuthor = run.data.head_commit?.author?.name || 'developer';
+        targetWorkflowId = run.data.workflow_id;
+        targetBranch = run.data.head_branch || undefined;
+        targetCreatedAt = run.data.created_at;
+        targetTriggerEvent = run.data.event || targetTriggerEvent;
         console.log(`  ✅ Commit: ${targetCommitSha.substring(0, 7)} by ${targetAuthor}`);
 
-        // Find the most recent successful run of the same workflow. This gives
-        // ACP a factual baseline for regression analysis instead of guessing
-        // whether the current commit introduced an already-existing failure.
-        if (run.data.workflow_id) {
-          try {
-            const history = await octokit.rest.actions.listWorkflowRuns({
-              owner, repo, workflow_id: run.data.workflow_id, status: 'success', per_page: 20
-            });
-            const previous = history.data.workflow_runs.find(r => r.id !== runId && r.conclusion === 'success');
-            if (previous) {
-              previousSuccessfulRunId = previous.id;
-              previousSuccessfulCommitSha = previous.head_sha;
-              console.log(`  ✅ Regression baseline: run ${previous.id}, commit ${previous.head_sha.substring(0, 7)}`);
-            }
-          } catch (historyErr) {
-            console.warn(`  ⚠️ Could not fetch previous successful run: ${(historyErr as Error).message}`);
-          }
-        }
       } catch (e) {
         console.warn(`  ⚠️ Could not fetch commit metadata: ${(e as Error).message}`);
       }
@@ -191,7 +184,9 @@ async function run(): Promise<void> {
           owner, repo, run_id: runId, per_page: 100
         });
         const failedJobs = jobsRes.data.jobs.filter(j => j.conclusion === 'failure');
-        const failedJob = failedJobs.find(j => j.steps?.some(step => step.conclusion === 'failure')) || failedJobs[0];
+        const failedJob = failedJobs
+          .filter(j => j.steps?.some(step => step.conclusion === 'failure'))
+          .sort((a, b) => new Date(a.started_at || a.completed_at || 0).getTime() - new Date(b.started_at || b.completed_at || 0).getTime())[0] || failedJobs[0];
 
         if (failedJob) {
           targetJobName = failedJob.name;
@@ -205,7 +200,38 @@ async function run(): Promise<void> {
           console.log(`  ✅ Logs: job="${failedJob.name}", failedStep="${targetFailedStep}"`);
 
           if (failedJobs.length > 1) {
-            console.warn(`  ⚠️ Workflow has ${failedJobs.length} failed jobs; analysing "${failedJob.name}".`);
+            console.warn(`  ⚠️ Workflow has ${failedJobs.length} failed jobs; primary analysis is limited to "${failedJob.name}".`);
+          }
+
+          // Find the most recent earlier successful run of the SAME workflow and branch.
+          // Also verify that the same job succeeded there before presenting it as a baseline.
+          if (targetWorkflowId) {
+            try {
+              const history = await octokit.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: targetWorkflowId, status: 'success', branch: targetBranch, per_page: 20
+              });
+              const previous = history.data.workflow_runs.find(r =>
+                r.id !== runId &&
+                r.conclusion === 'success' &&
+                new Date(r.created_at).getTime() < new Date(targetCreatedAt || 0).getTime()
+              );
+              if (previous) {
+                previousSuccessfulRunId = previous.id;
+                previousSuccessfulCommitSha = previous.head_sha;
+                try {
+                  const previousJobs = await octokit.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: previous.id, per_page: 100 });
+                  const previousJob = previousJobs.data.jobs.find(j => j.name === failedJob.name);
+                  previousSuccessfulJobName = previousJob?.name;
+                  previousSuccessfulJobPassed = previousJob?.conclusion === 'success';
+                } catch {
+                  previousSuccessfulJobName = failedJob.name;
+                  previousSuccessfulJobPassed = false;
+                }
+                console.log(`  ${previousSuccessfulJobPassed ? '✅' : '⚠️'} Regression baseline: run ${previous.id}, commit ${previous.head_sha.substring(0, 7)}, same job passed=${previousSuccessfulJobPassed}`);
+              }
+            } catch (historyErr) {
+              console.warn(`  ⚠️ Could not fetch previous successful run: ${(historyErr as Error).message}`);
+            }
           }
         } else {
           console.warn('  ⚠️ No conclusively failed job found in workflow run.');
@@ -219,9 +245,10 @@ async function run(): Promise<void> {
         const commitRes = await octokit.rest.repos.getCommit({
           owner, repo, ref: targetCommitSha, mediaType: { format: 'diff' }
         });
-        targetDiffSnippet = sanitizeText(String(commitRes.data))
-          .split('\n').slice(0, maxDiffLines).join('\n');
-        console.log('  ✅ Diff: fetched trigger-commit diff');
+        const fullSanitizedDiff = sanitizeText(String(commitRes.data));
+        targetChangedLines = extractChangedLinesFromDiff(fullSanitizedDiff);
+        targetDiffSnippet = selectDiffContext(fullSanitizedDiff.split('\n'), maxDiffLines);
+        console.log(`  ✅ Diff: fetched trigger-commit diff (${targetChangedLines.size} added lines tracked)`);
       } catch (e) {
         console.warn(`  ⚠️ Could not fetch trigger-commit diff: ${(e as Error).message}`);
       }
@@ -245,6 +272,8 @@ async function run(): Promise<void> {
           diffSnippet: targetDiffSnippet,
           previousSuccessfulRunId,
           previousSuccessfulCommitSha,
+          previousSuccessfulJobName,
+          previousSuccessfulJobPassed,
           hasPullRequest,
           pullNumber
         })
@@ -313,7 +342,7 @@ async function run(): Promise<void> {
         prompt: [
           {
             type: 'text',
-            text: `${systemPrompt}\n\n${userPrompt}`
+            text: `=== ANALYSIS POLICY (AUTHORITATIVE) ===\n${systemPrompt}\n=== END ANALYSIS POLICY ===\n\n${userPrompt}`
           }
         ]
       };
@@ -369,11 +398,13 @@ async function run(): Promise<void> {
       });
     }
 
+    const humanMarkdownReport = stripMachineAnalysisBlock(markdownReport);
+
     console.log('\n--- [GENERATED MARKDOWN REPORT] ---');
-    console.log(markdownReport);
+    console.log(humanMarkdownReport);
 
     try {
-      fs.writeFileSync(reportFile, markdownReport, 'utf8');
+      fs.writeFileSync(reportFile, humanMarkdownReport, 'utf8');
       console.log(`\n📄 Report saved → ${reportFile}`);
     } catch {
       // Non-fatal if filesystem is read-only
@@ -382,7 +413,7 @@ async function run(): Promise<void> {
     // -----------------------------------------------------------------------
     // Step 7: Write GitHub Actions Job Summary
     // -----------------------------------------------------------------------
-    const triggerLabel = pullNumber ? `PR #${pullNumber}` : (context.eventName || 'push');
+    const triggerLabel = pullNumber ? `PR #${pullNumber}` : targetTriggerEvent;
     try {
       await writeJobSummary({
         jobName: targetJobName,
@@ -390,7 +421,8 @@ async function run(): Promise<void> {
         commitSha: targetCommitSha,
         author: targetAuthor,
         triggerLabel,
-        markdownReport
+        markdownReport,
+        changedLines: targetChangedLines
       });
     } catch (summaryErr: unknown) {
       console.warn(`[summary] Could not write Job Summary: ${(summaryErr as Error).message}`);
@@ -401,7 +433,7 @@ async function run(): Promise<void> {
     // -----------------------------------------------------------------------
     if (pullNumber) {
       try {
-        emitPrAnnotations(markdownReport);
+        emitPrAnnotations(markdownReport, targetChangedLines);
       } catch (annoErr: unknown) {
         console.warn(`[annotations] Could not emit annotations: ${(annoErr as Error).message}`);
       }
@@ -412,7 +444,7 @@ async function run(): Promise<void> {
     // -----------------------------------------------------------------------
     if (pullNumber && markdownReport && !cliOptions.noExecute && githubToken !== 'dummy-local-token') {
       console.log(`💬 Posting diagnostic report to PR #${pullNumber}...`);
-      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${markdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP).*`;
+      const fullCommentBody = `${BOT_COMMENT_SIGNATURE}\n${humanMarkdownReport}\n\n---\n*Report generated by [pipeline-assistant](https://github.com/amadalavamsi/pipeline-assistant) via Agent Client Protocol (ACP).*`;
 
       try {
         const comments = await octokit.rest.issues.listComments({
@@ -449,7 +481,7 @@ async function run(): Promise<void> {
     core.setOutput('failed-job-name', targetJobName);
     core.setOutput('failed-step-name', targetFailedStep);
     core.setOutput('target-commit-sha', targetCommitSha);
-    core.setOutput('analysis-report', markdownReport);
+    core.setOutput('analysis-report', humanMarkdownReport);
     console.log('🎉 Pipeline Assistant completed successfully.');
 
   } catch (error: unknown) {

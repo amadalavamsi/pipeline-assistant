@@ -32,26 +32,68 @@ export interface ReadOnlyMcpServer {
 
 // Keep diff hunks and file headers instead of blindly taking the first N lines.
 // This reduces the chance that a large PR hides the relevant changed file.
-function selectDiffContext(lines: string[], maxLines: number): string {
+export function selectDiffContext(lines: string[], maxLines: number): string {
   if (lines.length <= maxLines) return lines.join('\n');
 
-  const headerIndices = lines.reduce<number[]>((acc, line, index) => {
-    if (line.startsWith('diff --git ') || line.startsWith('@@ ')) acc.push(index);
-    return acc;
-  }, []);
-
-  if (headerIndices.length === 0) return lines.slice(0, maxLines).join('\n');
-
   const selected = new Set<number>();
-  for (const index of headerIndices) {
-    for (let i = Math.max(0, index - 2); i < Math.min(lines.length, index + 8); i++) {
+  const fileHeaders: number[] = [];
+  const hunkHeaders: number[] = [];
+  lines.forEach((line, index) => {
+    if (line.startsWith('diff --git ')) fileHeaders.push(index);
+    if (line.startsWith('@@ ')) hunkHeaders.push(index);
+  });
+
+  // First keep file/hunk headers and a useful window around each hunk. This is
+  // much safer than taking only the first N lines of a large diff.
+  for (const index of [...fileHeaders, ...hunkHeaders]) {
+    for (let i = Math.max(0, index - 1); i < Math.min(lines.length, index + 32); i++) {
       selected.add(i);
       if (selected.size >= maxLines) break;
     }
     if (selected.size >= maxLines) break;
   }
 
-  return Array.from(selected).sort((a, b) => a - b).map(i => lines[i]).join('\n');
+  // If there is still room, add remaining changed lines so a relevant hunk is
+  // less likely to disappear simply because it was late in the diff.
+  for (let i = 0; i < lines.length && selected.size < maxLines; i++) {
+    if (lines[i].startsWith('+') && !lines[i].startsWith('+++')) selected.add(i);
+  }
+
+  return Array.from(selected)
+    .sort((a, b) => a - b)
+    .slice(0, maxLines)
+    .map(i => lines[i])
+    .join('\n');
+}
+
+/** Return repository-relative lines added by a unified diff. */
+export function extractChangedLinesFromDiff(diff: string): Set<string> {
+  const changed = new Set<string>();
+  let currentFile = '';
+  let newLine = 0;
+  for (const line of diff.split('\n')) {
+    const fileMatch = line.match(/^\+\+\+ b\/(.+)$/);
+    if (fileMatch) {
+      currentFile = fileMatch[1].trim();
+      continue;
+    }
+    const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      continue;
+    }
+    if (!currentFile || !newLine) continue;
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) {
+      changed.add(`${currentFile.replace(/^\.\//, '')}:${newLine}`);
+      newLine += 1;
+    } else if (line.startsWith('-')) {
+      // Removed lines do not exist in the new file, so do not annotate them.
+    } else {
+      newLine += 1;
+    }
+  }
+  return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +126,12 @@ export function createReadOnlyMcpServer(
               run_id: context.runId
             });
 
+            const requestedJob = typeof args.jobName === 'string' ? args.jobName.trim() : '';
             const failedJobs = jobsResponse.data.jobs.filter(j => j.conclusion === 'failure');
-            const failedJob = failedJobs.find(j => j.steps?.some(step => step.conclusion === 'failure')) || failedJobs[0];
+            const failedJob = (requestedJob ? failedJobs.find(j => j.name === requestedJob) : undefined) ||
+              failedJobs.filter(j => j.steps?.some(step => step.conclusion === 'failure'))
+                .sort((a, b) => new Date(a.started_at || a.completed_at || 0).getTime() - new Date(b.started_at || b.completed_at || 0).getTime())[0] ||
+              failedJobs[0];
 
             if (!failedJob) {
               const res = JSON.stringify({ message: 'No failed jobs found in workflow run.' });
@@ -196,7 +242,8 @@ export function createReadOnlyMcpServer(
               mediaType: { format: 'diff' }
             });
 
-            const maxLines = (args.maxLines as number) || context.maxDiffLines;
+            const requestedMax = Number(args.maxLines);
+            const maxLines = Number.isFinite(requestedMax) ? Math.min(context.maxDiffLines, Math.max(10, requestedMax)) : context.maxDiffLines;
             const rawDiff = String(commitResponse.data);
             const sanitized = sanitizeText(rawDiff);
             const diffLines = sanitized.split('\n');
@@ -270,7 +317,8 @@ export function createReadOnlyMcpServer(
               return JSON.stringify({ error: 'Missing required parameter: commitSha' });
             }
 
-            const maxLines = (args.maxLines as number) || context.maxDiffLines;
+            const requestedMax = Number(args.maxLines);
+            const maxLines = Number.isFinite(requestedMax) ? Math.min(context.maxDiffLines, Math.max(10, requestedMax)) : context.maxDiffLines;
             const commitResponse = await octokit.rest.repos.getCommit({
               owner: context.owner,
               repo: context.repo,

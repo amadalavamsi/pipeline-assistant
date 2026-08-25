@@ -1,10 +1,10 @@
 {
-  "_comment": "Default values for the pipeline-assistant agent. Edit here — never hardcode in TypeScript.",
+  "_comment": "Default values for the pipeline-assistant agent. Edit here \u2014 never hardcode in TypeScript.",
   "jobName": "CI-Job",
   "fallback": {
-    "rootCause": "Analysis of the failure logs identified build or test errors. Inspect the extract below.",
-    "suggestedFix": "Review the failing lines in the commit diff against the assertion requirements.",
-    "noOutputRootCause": "ACP agent produced no output. The agent may have timed out or failed silently.",
-    "noOutputSuggestedFix": "Review acp-debug.log for the full ACP protocol trace."
+    "rootCause": "ACP analysis was unavailable or could not be machine-validated. No root cause is being asserted to avoid misleading the developer.",
+    "suggestedFix": "Review the failure log and re-run the failed step. Re-run the Pipeline Assistant after ACP is available; no automated fix is recommended from this fallback.",
+    "noOutputRootCause": "ACP produced no usable machine-validated diagnosis. No root cause is being asserted.",
+    "noOutputSuggestedFix": "Re-run the failed step and inspect acp-debug.log for the ACP protocol failure."
   }
 }

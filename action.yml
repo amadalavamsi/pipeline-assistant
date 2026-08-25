@@ -28,7 +28,7 @@ inputs:
     required: false
     default: ''
   max-diff-lines:
-    description: 'Max lines of PR diff to send to the ACP agent (prevents token exhaustion)'
+    description: 'Max lines of trigger-commit diff context to send to the ACP agent (prevents token exhaustion)'
     required: false
     default: '2000'
 

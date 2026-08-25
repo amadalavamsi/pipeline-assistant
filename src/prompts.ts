@@ -28,6 +28,8 @@ export interface LiveCiDataContext {
   diffSnippet: string;
   previousSuccessfulRunId?: number;
   previousSuccessfulCommitSha?: string;
+  previousSuccessfulJobName?: string;
+  previousSuccessfulJobPassed?: boolean;
   hasPullRequest: boolean;
   pullNumber?: number;
 }
@@ -41,7 +43,7 @@ export interface OfflineContext {
 export function buildLiveCiUserPromptWithData(ctx: LiveCiDataContext): string {
   const {
     owner, repo, runId, commitSha, commitMessage, author, jobName, failedStep,
-    errorLog, diffSnippet, previousSuccessfulRunId, previousSuccessfulCommitSha, hasPullRequest, pullNumber
+    errorLog, diffSnippet, previousSuccessfulRunId, previousSuccessfulCommitSha, previousSuccessfulJobName, previousSuccessfulJobPassed, hasPullRequest, pullNumber
   } = ctx;
 
   const prLine = hasPullRequest
@@ -77,6 +79,8 @@ ${cleanCommitMsg}
 ${prLine}
 Previous successful run: ${previousSuccessfulRunId ?? 'N/A'}
 Previous successful commit: ${previousSuccessfulCommitSha ?? 'N/A'}
+Previous successful job: ${previousSuccessfulJobName ?? 'N/A'}
+Previous successful same-job result: ${previousSuccessfulRunId ? (previousSuccessfulJobPassed ? 'PASSED' : 'NOT_VERIFIED') : 'N/A'}
 </workflow_metadata>
 
 ## Failure Evidence

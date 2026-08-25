@@ -5,7 +5,8 @@
 ## Diagnosis
 
 - **Status**: UNKNOWN
-- **Confidence**: 40%
+- **Confidence**: N/A
+- **Commit Causality**: UNKNOWN
 
 ## Root Cause
 
